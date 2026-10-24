@@ -1,0 +1,19 @@
+{
+  "name": "magic-morning-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram-бот клуба «Магия утра» на grammY",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "backup": "node src/database/backup-cli.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
+    "grammy": "^1.35.0"
+  }
+}
+
