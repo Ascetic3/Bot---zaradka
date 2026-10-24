@@ -45,13 +45,14 @@ function readOnlyInspection(filePath) {
     if (!requiredTables.every((table) => tables.has(table))) throw new Error("Существующая demo.sqlite не содержит ожидаемую схему. Файл оставлен без изменений.");
     const metadataPresent = tables.has("demo_seed_metadata");
     const counts = Object.fromEntries([...requiredTables].map((table) => [table, probe.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count]));
+    const metadataCount = metadataPresent ? probe.prepare("SELECT COUNT(*) AS count FROM demo_seed_metadata").get().count : 0;
     if (!metadataPresent && Object.values(counts).some((count) => count !== 0)) {
       throw new Error("В demo.sqlite уже есть неразмеченные данные. Автоматическое заполнение остановлено, существующие записи сохранены.");
     }
     let metadata = null;
     if (metadataPresent) metadata = probe.prepare("SELECT seed_name, seed_version, seeded_at, participant_count FROM demo_seed_metadata WHERE seed_name=?").get(seedName) || null;
     if (metadataPresent && !metadata) throw new Error("В demo.sqlite есть неизвестная метка набора. Файл оставлен без изменений.");
-    return { metadata, counts, tables };
+    return { metadata, metadataCount, counts, tables };
   } finally { probe.close(); }
 }
 
@@ -60,24 +61,44 @@ function expectedAccountKeys(records) {
 }
 
 function assertSeedMatches(database, records, metadata) {
+  const connection = database.db ?? database;
   if (metadata.seed_version !== seedVersion || metadata.participant_count !== records.length) {
     throw new Error("Версия демонстрационного набора не совпадает. Существующие данные не изменены.");
   }
-  const actual = database.db.prepare(`SELECT id, first_name, last_name, phone, city, email, preferred_contact, referral_source,
-      registered_at, updated_at, phone_confirmed_at, personal_data_consent, consent_at FROM participants ORDER BY id`).all();
+  const hasConsentVersion = connection.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_version");
+  const consentVersionSelect = hasConsentVersion ? "consent_version" : "NULL AS consent_version";
+  const actual = connection.prepare(`SELECT id, first_name, last_name, phone, city, email, preferred_contact, referral_source,
+      registered_at, updated_at, phone_confirmed_at, personal_data_consent, consent_at, ${consentVersionSelect} FROM participants ORDER BY id`).all();
   if (actual.length !== records.length) throw new Error("Демонстрационная база изменена после заполнения. Повторное заполнение остановлено без изменений.");
   const expectedByPhone = new Map(records.map((person) => [person.phone, person]));
-  for (const row of actual) {
+  for (const [index, row] of actual.entries()) {
     const expected = expectedByPhone.get(row.phone);
     if (!expected) throw new Error("В демонстрационной базе есть неизвестные участники. Повторное заполнение остановлено без изменений.");
-    for (const key of ["first_name", "last_name", "phone", "city", "email", "preferred_contact", "referral_source", "registered_at", "updated_at", "phone_confirmed_at", "personal_data_consent", "consent_at"]) {
+    if (row.id !== index + 1) throw new Error("Порядок демонстрационных записей изменился. Проверка остановлена без изменений.");
+    for (const key of ["first_name", "last_name", "phone", "city", "email", "preferred_contact", "referral_source", "registered_at", "updated_at", "phone_confirmed_at", "personal_data_consent", "consent_at", "consent_version"]) {
       if ((row[key] ?? null) !== (expected[key] ?? null)) throw new Error("Содержимое демонстрационной базы изменилось. Повторное заполнение остановлено без изменений.");
     }
   }
-  const accountRows = database.db.prepare(`SELECT p.phone, a.platform, a.messenger_user_id FROM accounts a
-      JOIN participants p ON p.id=a.participant_id ORDER BY p.phone, a.platform, a.messenger_user_id`).all();
-  const actualKeys = accountRows.map((row) => `${row.phone}\u0000${row.platform}\u0000${row.messenger_user_id}`).sort();
-  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedAccountKeys(records))) throw new Error("Связанные демонстрационные аккаунты изменились. Повторное заполнение остановлено без изменений.");
+  const accountRows = connection.prepare(`SELECT p.phone, a.participant_id, a.platform, a.messenger_user_id FROM accounts a
+      LEFT JOIN participants p ON p.id=a.participant_id ORDER BY p.phone, a.platform, a.messenger_user_id`).all();
+  const actualKeys = accountRows.map((row) => `${row.phone ?? `ORPHAN-${row.participant_id}`}\u0000${row.platform}\u0000${row.messenger_user_id}`).sort();
+  if (JSON.stringify(actualKeys) !== JSON.stringify(expectedAccountKeys(records))) throw new Error("Связанные демонстрационные аккаунты изменились. Проверка остановлена без изменений.");
+  if (connection.prepare("SELECT COUNT(*) AS count FROM registration_drafts").get().count !== 0) throw new Error("В демонстрационной базе обнаружены незавершённые анкеты. Проверка остановлена без изменений.");
+}
+
+function assertDemoOwner(database, ownerTelegramId) {
+  const connection = database.db ?? database;
+  const admins = connection.prepare("SELECT telegram_id, role FROM admins ORDER BY telegram_id").all();
+  const owners = admins.filter((admin) => admin.role === "owner");
+  if (owners.length !== 1 || owners[0].telegram_id !== String(ownerTelegramId)) {
+    throw new Error("В демонстрационной базе должен оставаться единственный настроенный владелец. Проверка остановлена без изменений.");
+  }
+  // Администраторов владелец может добавлять и удалять через бота. Это
+  // изменяемые рабочие записи, поэтому их число не является частью seed-проверки.
+  // Проверяем лишь допустимый формат ролей/ID; новые права здесь не назначаются.
+  if (admins.some((admin) => !/^\d+$/.test(String(admin.telegram_id)) || !["owner", "admin"].includes(admin.role))) {
+    throw new Error("В таблице администраторов найдена некорректная запись. Проверьте её вручную; база не изменена.");
+  }
 }
 
 function seedDemoDatabase({
@@ -119,6 +140,9 @@ function seedDemoDatabase({
       )`);
       const metadata = database.db.prepare("SELECT seed_name, seed_version, seeded_at, participant_count FROM demo_seed_metadata WHERE seed_name=?").get(seedName);
       if (metadata) {
+        const inspection = readOnlyInspection(resolvedTarget);
+        if (inspection.metadataCount !== 1) throw new Error("В демонстрационной базе обнаружены лишние метки набора. Повторное заполнение остановлено без изменений.");
+        assertDemoOwner(database, ownerTelegramId);
         const records = createDemoRecords(metadata.seeded_at);
         assertSeedMatches(database, records, metadata);
         return { inserted: 0, alreadySeeded: true, count: records.length };
@@ -155,17 +179,20 @@ function seedDemoDatabase({
   }
 }
 
-function verifyDemoDatabase({ databasePath = defaultDemoPath, ownerTelegramId, DatabaseConstructor = Database } = {}) {
+function verifyDemoDatabase({ databasePath = defaultDemoPath, productionDatabasePath = defaultProductionPath, ownerTelegramId, DatabaseConstructor = Database } = {}) {
+  if (canonicalPath(databasePath) === canonicalPath(productionDatabasePath)) throw new Error("Отказ: для демонстрационного запуска указан путь рабочей базы.");
+  if (!/^\d+$/.test(String(ownerTelegramId || ""))) throw new Error("OWNER_TELEGRAM_ID не настроен корректно для демонстрационной базы.");
   if (!fs.existsSync(databasePath)) throw new Error("Демонстрационная база отсутствует. Сначала выполните npm.cmd run demo:seed.");
   const inspection = readOnlyInspection(databasePath);
-  if (!inspection.metadata || inspection.metadata.participant_count !== 150 || inspection.counts.participants !== 150) {
+  if (!inspection.metadata || inspection.metadataCount !== 1 || inspection.metadata.seed_name !== seedName || inspection.metadata.seed_version !== seedVersion || inspection.metadata.participant_count !== 150 || inspection.counts.participants !== 150) {
     throw new Error("Демонстрационная база не содержит проверенный набор из 150 участников.");
   }
+  const expectedRecords = createDemoRecords(inspection.metadata.seeded_at);
   const probe = new DatabaseConstructor(databasePath, { readonly: true, fileMustExist: true });
   try {
-    if (probe.prepare("SELECT role FROM admins WHERE telegram_id=?").get(String(ownerTelegramId))?.role !== "owner") {
-      throw new Error("OWNER_TELEGRAM_ID не является владельцем демонстрационной базы.");
-    }
+    assertSeedMatches(probe, expectedRecords, inspection.metadata);
+    if (inspection.counts.registration_drafts !== 0) throw new Error("В демонстрационной базе обнаружены незавершённые анкеты. Запуск остановлен без изменений.");
+    assertDemoOwner(probe, ownerTelegramId);
     return { count: inspection.counts.participants, ownerConfigured: true };
   } finally { probe.close(); }
 }

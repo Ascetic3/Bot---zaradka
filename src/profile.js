@@ -1,12 +1,9 @@
 const { Keyboard } = require("grammy");
 const db = require("./database");
 const { isPrivateChat } = require("./chat-guards");
-
-const menuKeyboard = new Keyboard()
-  .text("Зарегистрироваться")
-  .row()
-  .text("Моя анкета")
-  .resized();
+const { validateParticipantUpdate } = require("./participant-service");
+const { createRateLimiter, allowRequest } = require("./request-limits");
+const { mainMenuKeyboard, mainMenuText } = require("./main-menu");
 const fields = {
   "Имя": "first_name", "Фамилия": "last_name", "Город": "city",
   "Электронная почта": "email", "Предпочтительный способ связи": "preferred_contact",
@@ -20,27 +17,34 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? "Не указано" : date.toLocaleDateString("ru-RU", { timeZone: "UTC" });
 }
 
-function registerProfile(bot) {
+function registerProfile(bot, { rateLimiter = createRateLimiter() } = {}) {
   bot.hears("Моя анкета", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("🔒 Просмотр анкеты доступен только в личном чате с ботом.");
     const participant = db.findParticipantByTelegramId(ctx.from.id);
     if (!participant) {
+      if (db.findParticipantByTelegramIdIncludingWithdrawn(ctx.from.id)) return ctx.reply("Просмотр анкеты временно ограничен. Обратитесь к организатору клуба.");
       return ctx.reply("Вы ещё не зарегистрированы в клубе „Магия утра“. ☀️\n\nДля создания анкеты нажмите „Зарегистрироваться“.");
     }
     const value = (field) => participant[field] || "Не указано";
     const summary = `Ваша анкета:\n\nИмя: ${value("first_name")}\nФамилия: ${value("last_name")}\nТелефон: ${value("phone")}\nГород проживания: ${value("city")}\nEmail: ${value("email")}\nПредпочтительный способ связи: ${value("preferred_contact")}\nОткуда узнали о клубе: ${value("referral_source")}\nДата регистрации: ${formatDate(participant.registered_at)}`;
-    return ctx.reply(summary, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🏠 Главное меню").resized() });
+    return ctx.reply(summary, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🔐 Мои данные").row().text("🔗 Связанные аккаунты").row().text("🏠 Главное меню").resized() });
   });
   bot.hears("🏠 Главное меню", (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("Главное меню доступно только в личном чате с ботом.");
+    const draft = db.getDraft("telegram", ctx.from.id);
+    if (draft?.current_step.startsWith("profile_edit")) db.deleteDraft("telegram", ctx.from.id);
     return ctx.reply(
-      "Добро пожаловать в клуб „Магия утра“! ☀️\n\nЗдесь вы можете зарегистрироваться в клубе и посмотреть свою анкету.\n\nВыберите действие:",
-      { reply_markup: menuKeyboard }
+      mainMenuText,
+      { reply_markup: mainMenuKeyboard }
     );
   });
   bot.hears("✏️ Изменить данные", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("Анкету можно изменять только в личном чате с ботом.");
-    if (!db.findParticipantByTelegramId(ctx.from.id)) return ctx.reply("Анкета не найдена.");
+    if (!db.findParticipantByTelegramId(ctx.from.id)) {
+      if (db.findParticipantByTelegramIdIncludingWithdrawn(ctx.from.id)) return ctx.reply("Редактирование анкеты временно ограничено. Обратитесь к организатору клуба.");
+      return ctx.reply("Анкета не найдена.");
+    }
+    if (!(await allowRequest(ctx, rateLimiter, "profile_edit"))) return;
     const keyboard = new Keyboard();
     for (const field of Object.keys(fields)) keyboard.text(field).row();
     keyboard.text("Телефон (изменение недоступно)").row().text("Отмена").resized();
@@ -61,6 +65,8 @@ function registerProfile(bot) {
     if (!isPrivateChat(ctx)) return ctx.reply("Редактирование можно продолжить только в личном чате с ботом.");
     const input = ctx.message.text.trim();
     if (input === "Отмена") { db.deleteDraft("telegram", ctx.from.id); return ctx.reply("Редактирование отменено."); }
+    if (input === "🔗 Связанные аккаунты") { db.deleteDraft("telegram", ctx.from.id); return next(); }
+    if (!(await allowRequest(ctx, rateLimiter, "profile_edit"))) return;
     const participant = db.findParticipantByTelegramId(ctx.from.id);
     if (!participant) { db.deleteDraft("telegram", ctx.from.id); return ctx.reply("Анкета не найдена."); }
     if (draft.current_step === "profile_edit_select") {
@@ -75,21 +81,23 @@ function registerProfile(bot) {
     }
     const field = draft.current_step.slice("profile_edit:".length);
     if (!Object.values(fields).includes(field)) { db.deleteDraft("telegram", ctx.from.id); return ctx.reply("Состояние редактирования сброшено. Откройте изменение анкеты заново."); }
-    let value = input;
-    if (input === "Очистить поле" && ["city", "email", "preferred_contact", "referral_source"].includes(field)) value = null;
-    else if (["first_name", "last_name"].includes(field) && (!value || value.length > 100)) return ctx.reply("Поле обязательно. Введите непустое значение длиной до 100 символов.");
-    else if (["city", "email", "referral_source"].includes(field) && !value) return ctx.reply("Введите значение или нажмите «Очистить поле».");
-    else if (field === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return ctx.reply("Введите корректный email или нажмите «Очистить поле».");
-    else if (field === "preferred_contact" && !contactOptions.includes(value)) return ctx.reply("Выберите способ связи кнопкой.");
-    if (field === "preferred_contact" && value === "Электронная почта" && !participant.email) return ctx.reply("Сначала добавьте электронную почту, затем выберите её способом связи.");
-    db.updateParticipant(participant.id, { [field]: value });
+    let rawValue = input;
+    if (input === "Очистить поле" && ["city", "email", "preferred_contact", "referral_source"].includes(field)) rawValue = null;
+    else if (!input) return ctx.reply("Введите значение или нажмите «Очистить поле».");
+    let value;
+    try { value = validateParticipantUpdate(participant, field, rawValue); }
+    catch (error) { return ctx.reply(error.message); }
+    const saved = db.updateParticipant(participant.id, { [field]: value });
+    if (!saved) {
+      db.deleteDraft("telegram", ctx.from.id);
+      return ctx.reply("Редактирование закрыто: доступ к анкете ограничен после изменения согласия.");
+    }
     db.deleteDraft("telegram", ctx.from.id);
     const updated = db.findParticipantByTelegramId(ctx.from.id);
     const show = (v) => v || "Не указано";
     const summary = `Ваша анкета:\n\nИмя: ${show(updated.first_name)}\nФамилия: ${show(updated.last_name)}\nТелефон: ${show(updated.phone)}\nГород проживания: ${show(updated.city)}\nEmail: ${show(updated.email)}\nПредпочтительный способ связи: ${show(updated.preferred_contact)}\nОткуда узнали о клубе: ${show(updated.referral_source)}\nДата регистрации: ${formatDate(updated.registered_at)}`;
-    return ctx.reply(`Данные успешно изменены.\n\n${summary}`, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🏠 Главное меню").resized() });
+    return ctx.reply(`Данные успешно изменены.\n\n${summary}`, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🔐 Мои данные").row().text("🔗 Связанные аккаунты").row().text("🏠 Главное меню").resized() });
   });
 }
 
 module.exports = { registerProfile };
-

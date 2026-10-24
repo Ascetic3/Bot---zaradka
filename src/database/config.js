@@ -1,9 +1,29 @@
 const os = require("node:os");
 const path = require("node:path");
+const fs = require("node:fs");
 
 function getDatabasePath(env = process.env) {
   const fallback = path.resolve(__dirname, "../../data/club.sqlite");
   return env.DB_PATH ? path.resolve(env.DB_PATH) : fallback;
+}
+
+function normalizeDatabasePath(filePath) {
+  const absolute = path.resolve(filePath);
+  let normalized = absolute;
+  try { normalized = fs.realpathSync.native ? fs.realpathSync.native(absolute) : fs.realpathSync(absolute); }
+  catch { normalized = path.normalize(absolute); }
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function classifyDatabasePath(databasePath, { demoMode = process.env.DEMO_MODE, projectRoot = path.resolve(__dirname, "../..") } = {}) {
+  const resolved = normalizeDatabasePath(databasePath);
+  const demoPath = normalizeDatabasePath(path.join(projectRoot, "data", "demo.sqlite"));
+  if (String(demoMode).toLowerCase() === "true") {
+    if (resolved !== demoPath) throw new Error("Демонстрационный режим настроен на путь, отличный от demo.sqlite; источник не подтверждён.");
+    return "demo";
+  }
+  if (resolved === demoPath) throw new Error("Отказ: demo.sqlite нельзя резервировать как рабочую базу.");
+  return "production";
 }
 
 function getBackupDirectory(env = process.env) {
@@ -28,5 +48,4 @@ function readBackupSettings(env = process.env) {
   };
 }
 
-module.exports = { getDatabasePath, getBackupDirectory, readBackupSettings };
-
+module.exports = { getDatabasePath, getBackupDirectory, readBackupSettings, normalizeDatabasePath, classifyDatabasePath };

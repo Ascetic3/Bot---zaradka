@@ -239,6 +239,66 @@ test("отмена во время поиска всё равно проверя
   } finally { x.close(); }
 });
 
+test("переключение с поиска на добавление и отмена очищают предыдущее состояние", async () => {
+  const x = setup(); try {
+    x.addParticipant();
+    await x.beginSearch();
+    assert.ok(x.buttons(x.sent.at(-1)).includes("Отмена"));
+    assert.match((await x.send("➕ Добавить администратора")).text, /Telegram ID нового администратора/);
+    assert.match((await x.send("Отмена")).text, /Действие отменено/);
+    assert.ok(x.buttons(x.sent.at(-1)).includes("📋 Список администраторов"));
+    assert.equal(x.buttons(x.sent.at(-1)).includes("Отмена"), false);
+    const priorCount = x.sent.length;
+    await x.send("не-числовой-старый-запрос");
+    assert.equal(x.sent.length, priorCount);
+    assert.equal(x.db.getAdminRole("не-числовой-старый-запрос"), null);
+    assert.equal(x.db.getParticipantCount(), 1);
+  } finally { x.close(); }
+});
+
+test("после переключения поиск очищается, а старый запрос не попадает в новую операцию", async () => {
+  const x = setup(); try {
+    x.addParticipant();
+    await x.beginSearch();
+    await x.send("➕ Добавить администратора");
+    const response = await x.send("10002");
+    assert.match(response.text, /добавлен/i);
+    assert.equal(x.db.getAdminRole("10002"), "admin");
+    const previous = x.sent.length;
+    await x.send("Федор");
+    assert.equal(x.sent.length, previous);
+    assert.equal(x.db.getParticipantCount(), 1);
+  } finally { x.close(); }
+});
+
+test("после отзыва роли незавершённый поиск очищается и не показывает результат", async () => {
+  const x = setup(); try {
+    x.db.addAdmin("10002");
+    x.addParticipant();
+    await x.send("🔎 Найти участника", "10002");
+    x.db.removeAdmin("10002");
+    const response = await x.send("Федор", "10002");
+    assert.match(response.text, /доступ отозван|нет доступа/i);
+    assert.equal(x.db.getParticipantCount(), 1);
+  } finally { x.close(); }
+});
+
+test("состояния двух администраторов независимы", async () => {
+  const x = setup(); try {
+    x.db.addAdmin("10002");
+    x.addParticipant();
+    await x.beginSearch();
+    await x.send("🔎 Найти участника", "10002");
+    assert.match((await x.send("Тест")).text, /Результаты поиска/);
+    assert.match((await x.send("Отмена", "10002")).text, /Административное меню/);
+    const ownerSelection = x.buttons(x.sent[2]).find((button) => button.startsWith("👤 "));
+    assert.ok(ownerSelection);
+    assert.match((await x.send(ownerSelection)).text, /Анкета участника/);
+    assert.equal(x.db.getParticipantCount(), 1);
+    assert.equal(x.db.getAdminRole("10002"), "admin");
+  } finally { x.close(); }
+});
+
 test("отмена добавления администратора возвращает меню управления", async () => {
   const x = setup();
   try {
@@ -276,4 +336,3 @@ test("отмена выгрузки Excel возвращает подходящ�
     assert.equal(x.buttons(response).includes("Отмена"), false);
   } finally { x.close(); }
 });
-

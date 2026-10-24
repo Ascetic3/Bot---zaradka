@@ -13,6 +13,7 @@ function setup() {
   process.env.DB_PATH = path.join(dir, "test.sqlite");
   process.env.OWNER_TELEGRAM_ID = String(ownerId);
   process.env.PRIVACY_POLICY_URL = "https://policy.invalid/test";
+  process.env.PRIVACY_POLICY_VERSION = "test-policy-v1";
   for (const name of ["database", "registration", "admin", "myid"]) {
     const target = name === "database" ? "../src/database" : `../src/${name}`;
     delete require.cache[require.resolve(target)];
@@ -47,7 +48,11 @@ function setup() {
   function startDraft(id = userId) {
     db.saveDraft("telegram", id, "first_name", {
       policy_url: "https://policy.invalid/test",
-      consent_at: "2026-10-23T00:00:00.000Z"
+      policy_version: "test-policy-v1",
+      consent_at: "2026-10-23T00:00:00.000Z",
+      consent_version: "test-policy-v1",
+      consent_given_by: String(id),
+      personal_data_consent: true
     });
   }
   return {
@@ -55,7 +60,7 @@ function setup() {
     close() {
       try { db.closeDatabase(); } catch {}
       fs.rmSync(dir, { recursive: true, force: true });
-      for (const key of ["DB_PATH", "OWNER_TELEGRAM_ID", "PRIVACY_POLICY_URL"]) delete process.env[key];
+      for (const key of ["DB_PATH", "OWNER_TELEGRAM_ID", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "DEMO_MODE"]) delete process.env[key];
       for (const name of ["database", "registration", "admin", "myid"]) {
         const target = name === "database" ? "../src/database" : `../src/${name}`;
         delete require.cache[require.resolve(target)];
@@ -105,4 +110,3 @@ test("после возврата из меню регистрация прод�
     assert.equal(x.db.getDraft("telegram", userId).answers.first_name, "Алексей");
   } finally { x.close(); }
 });
-

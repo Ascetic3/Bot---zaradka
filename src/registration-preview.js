@@ -2,11 +2,14 @@ const { Keyboard } = require("grammy");
 const { isPrivateChat } = require("./chat-guards");
 const { registrationFlow } = require("./registration");
 const db = require("./database");
+const { validateFieldValue } = require("./participant-service");
+const { createRateLimiter, allowRequest } = require("./request-limits");
+const { ExpiringMap } = require("./expiring-map");
 
 const TEST_PHONE = "+70000000000";
 const CANCEL = "❌ Отмена";
 const TEST_PHONE_BUTTON = "🧪 Использовать тестовый номер";
-const states = new Map();
+const states = new ExpiringMap(30 * 60_000);
 const { prompts, order, optional, values, fieldNames } = registrationFlow;
 
 function questionKeyboard(step) {
@@ -28,7 +31,7 @@ function summaryText(answers) {
   return `Предварительный просмотр анкеты:\n\nИмя: ${answers.first_name || "Не указано"}\nФамилия: ${answers.last_name || "Не указано"}\nТелефон: ${answers.phone || "Не указано"}\nГород: ${answers.city || "Не указано"}\nEmail: ${answers.email || "Не указано"}\nПредпочтительный способ связи: ${answers.preferred_contact || "Не указано"}\nОткуда узнали о клубе: ${answers.referral_source || "Не указано"}\n\nЭто предварительный просмотр. Анкета не будет сохранена.`;
 }
 
-function registerRegistrationPreview(bot, { database = db, getRole = (id) => database.getAdminRole(id) } = {}) {
+function registerRegistrationPreview(bot, { database = db, getRole = (id) => database.getAdminRole(id), rateLimiter = createRateLimiter() } = {}) {
   const replyQuestion = (ctx, state) => {
     const step = state.step;
     const prompt = step === "preferred_contact" || step === "referral_source" ? choicesKeyboard(step) : questionKeyboard(step);
@@ -42,6 +45,7 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
   bot.command("preview_registration", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("Предварительный просмотр доступен только в личном чате с ботом.");
     if (!ctx.from || getRole(ctx.from.id) !== "owner") return ctx.reply("Предварительный просмотр доступен только владельцу клуба.");
+    if (!(await allowRequest(ctx, rateLimiter, "preview"))) return;
     let state = states.get(String(ctx.from.id));
     if (!state) {
       state = { step: "first_name", answers: {}, editing: false, awaitingReferralDetail: false };
@@ -63,9 +67,34 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
 
     const key = String(ctx.from.id);
     const state = states.get(key);
+    if (input === "🏠 Главное меню") {
+      states.delete(key);
+      return next();
+    }
+    if (input === "🔗 Связанные аккаунты") return next();
     if (input === CANCEL || input === "❌ Отменить регистрацию" || input === "Отмена") {
       states.delete(key);
       return ctx.reply("Предварительный просмотр отменён. Данные не сохранены.");
+    }
+    if (!(await allowRequest(ctx, rateLimiter, "preview_continue"))) return;
+
+    // Команды навигации разбираются до значения текущего вопроса, иначе
+    // «Назад» на шаге телефона будет ошибочно восприниматься как номер.
+    if (input === "⬅️ Назад") {
+      if (state.awaitingReferralDetail) {
+        state.awaitingReferralDetail = false;
+        return replyQuestion(ctx, state);
+      }
+      if (state.awaitingFieldSelection || state.editing) {
+        state.awaitingFieldSelection = false;
+        state.editing = false;
+        state.step = "confirm";
+        return replySummary(ctx, state);
+      }
+      const index = order.indexOf(state.step);
+      if (index <= 0) return replyQuestion(ctx, state);
+      state.step = order[index - 1];
+      return replyQuestion(ctx, state);
     }
 
     if (state.step === "confirm") {
@@ -92,30 +121,28 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
     if (state.step === "phone") {
       if (input !== TEST_PHONE_BUTTON) return ctx.reply("В демонстрации нельзя вводить или отправлять реальный номер. Нажмите кнопку «🧪 Использовать тестовый номер».", { reply_markup: questionKeyboard("phone") });
       state.answers.phone = TEST_PHONE;
-    } else if (input === "⬅️ Назад") {
-      if (state.awaitingReferralDetail) state.awaitingReferralDetail = false;
-      const index = order.indexOf(state.step);
-      if (index <= 0) return replyQuestion(ctx, state);
-      state.step = order[index - 1];
-      return replyQuestion(ctx, state);
     } else if (input === "Пропустить" && optional.has(state.step)) {
-      state.answers[state.step] = null;
+      try { state.answers[state.step] = validateFieldValue(state.step, null, state.answers); }
+      catch (error) { return ctx.reply(error.message); }
     } else if (state.awaitingReferralDetail) {
-      if (!input || input.length > 120) return ctx.reply("Напишите короткий ответ до 120 символов.");
-      state.answers.referral_source = input;
+      try { state.answers.referral_source = validateFieldValue("referral_source", input, state.answers); }
+      catch (error) { return ctx.reply(error.message); }
       state.awaitingReferralDetail = false;
     } else if (state.step === "first_name" || state.step === "last_name") {
-      if (!input || input.length > 100) return ctx.reply("Ответ обязателен и должен быть не длиннее 100 символов.");
-      state.answers[state.step] = input;
+      try { state.answers[state.step] = validateFieldValue(state.step, input, state.answers); }
+      catch (error) { return ctx.reply(error.message); }
     } else if (state.step === "city") {
-      if (!input || input.length > 100) return ctx.reply("Введите город или нажмите «Пропустить».");
-      state.answers.city = input;
+      if (!input) return ctx.reply("Введите город или нажмите «Пропустить».");
+      try { state.answers.city = validateFieldValue("city", input, state.answers); }
+      catch (error) { return ctx.reply(error.message); }
     } else if (state.step === "email") {
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) return ctx.reply("Введите корректный email или нажмите «Пропустить».");
-      state.answers.email = input;
+      if (!input) return ctx.reply("Введите корректный email или нажмите «Пропустить».");
+      try { state.answers.email = validateFieldValue("email", input, state.answers); }
+      catch (error) { return ctx.reply(error.message); }
     } else if (state.step === "preferred_contact") {
-      if (!values.preferred_contact.includes(input) || (input === "Электронная почта" && !state.answers.email)) return ctx.reply("Выберите способ кнопкой. Для электронной почты сначала укажите email.", { reply_markup: choicesKeyboard(state.step) });
-      state.answers.preferred_contact = input;
+      if (!values.preferred_contact.includes(input)) return ctx.reply("Выберите способ кнопкой.", { reply_markup: choicesKeyboard(state.step) });
+      try { state.answers.preferred_contact = validateFieldValue("preferred_contact", input, state.answers); }
+      catch (error) { return ctx.reply(`${error.message} Выберите способ кнопкой.`, { reply_markup: choicesKeyboard(state.step) }); }
     } else if (state.step === "referral_source") {
       if (input === "Другое") {
         state.awaitingReferralDetail = true;
@@ -147,6 +174,7 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
     state.step = index === order.length - 1 ? "confirm" : order[index + 1];
     return state.step === "confirm" ? replySummary(ctx, state) : replyQuestion(ctx, state);
   });
+  return () => states.stop();
 }
 
 module.exports = { registerRegistrationPreview, previewTestPhone: TEST_PHONE };

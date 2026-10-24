@@ -12,7 +12,7 @@ function setup({ failSendMessage = false, policy = "https://policy.invalid/test"
   process.env.DB_PATH = path.join(dir, "test.sqlite");
   process.env.PRIVACY_POLICY_URL = policy;
   process.env.OWNER_TELEGRAM_ID = String(userId);
-  for (const modulePath of ["../src/database", "../src/registration", "../src/profile", "../src/chat-guards", "../src/error-handler", "../src/main-menu", "../src/admin", "../src/myid"]) {
+  for (const modulePath of ["../src/database", "../src/participant-service", "../src/registration", "../src/profile", "../src/chat-guards", "../src/error-handler", "../src/main-menu", "../src/admin", "../src/myid"]) {
     delete require.cache[require.resolve(modulePath)];
   }
   const db = require("../src/database");
@@ -270,4 +270,3 @@ test("ошибка grammY распознаётся как техническая
   });
   assert.doesNotMatch(JSON.stringify(details), /sensitive|private payload/);
 });
-

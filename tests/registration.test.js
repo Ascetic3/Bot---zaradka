@@ -10,8 +10,11 @@ function setup(policy = "https://policy.invalid/test") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "magic-registration-"));
   process.env.DB_PATH = path.join(dir, "registration.sqlite");
   process.env.PRIVACY_POLICY_URL = policy;
+  process.env.PRIVACY_POLICY_VERSION = "test-policy-v1";
+  process.env.PHONE_PROOF_SECRET = "synthetic-registration-test-secret-v1";
   delete require.cache[require.resolve("../src/database")];
   delete require.cache[require.resolve(modulePath)];
+  delete require.cache[require.resolve("../src/participant-service")];
   const db = require("../src/database");
   let lastDbError = null;
   const realAdd = db.addParticipant;
@@ -28,7 +31,7 @@ function setup(policy = "https://policy.invalid/test") {
     await bot.handleUpdate(update);
     return response;
   }
-  return { db, send, getLastDbError: () => lastDbError, close() { db.closeDatabase(); fs.rmSync(dir, { recursive: true, force: true }); delete process.env.DB_PATH; } };
+  return { db, send, getLastDbError: () => lastDbError, close() { db.closeDatabase(); fs.rmSync(dir, { recursive: true, force: true }); delete process.env.DB_PATH; delete process.env.PRIVACY_POLICY_URL; delete process.env.PRIVACY_POLICY_VERSION; delete process.env.PHONE_PROOF_SECRET; delete process.env.DEMO_MODE; delete require.cache[require.resolve("../src/participant-service")]; } };
 }
 const message = (text) => ({ text });
 const contact = (id, number = "+79001234567") => ({ contact: { phone_number: number, user_id: id } });
@@ -39,7 +42,7 @@ test("собственный контакт, шаги, сохранение че
  assert.match(await x.send(contact(123)),/только ваш контакт/i); assert.equal(x.db.getDraft("telegram",userId).current_step,"phone");
  assert.match(await x.send(contact(userId)),/город/i); assert.equal(x.db.getDraft("telegram",userId).answers.phone,"+79001234567");
  await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); assert.match(await x.send(message("Пропустить")),/Проверьте ваши данные/i);
- const confirmation = await x.send(message("✅ Подтвердить регистрацию")); assert.match(confirmation,/Регистрация завершена/i); assert.equal(x.getLastDbError(),null); assert.equal(x.db.getParticipantCount(),1); assert.ok(x.db.findParticipantByTelegramId(userId)); assert.equal(x.db.getDraft("telegram",userId),undefined);
+ const confirmation = await x.send(message("✅ Подтвердить регистрацию")); assert.match(confirmation,/Регистрация завершена/i); assert.equal(x.getLastDbError(),null); assert.equal(x.db.getParticipantCount(),1); assert.ok(x.db.findParticipantByTelegramId(userId)); assert.equal(x.db.findParticipantByTelegramId(userId).consent_version,"test-policy-v1"); assert.ok(x.db.findParticipantByTelegramId(userId).consent_at); assert.equal(x.db.getDraft("telegram",userId),undefined);
  assert.match(await x.send(message("Зарегистрироваться")),/уже зарегистрированы/i); assert.equal(x.db.getParticipantCount(),1);
  } finally {x.close();} });
 test("некорректный email и восстановление черновика после повторного открытия базы", async () => { const x=setup(); try { await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Тест")); await x.send(message("Проверка")); await x.send(contact(userId)); await x.send(message("Пропустить")); assert.match(await x.send(message("не email")),/корректный email/i); assert.equal(x.db.getDraft("telegram",userId).current_step,"email"); x.db.closeDatabase(); delete require.cache[require.resolve("../src/database")]; const db=require("../src/database"); assert.equal(db.getDraft("telegram",userId).current_step,"email"); db.closeDatabase(); fs.rmSync(path.dirname(process.env.DB_PATH),{recursive:true,force:true}); delete process.env.DB_PATH; } finally { try{x.db.closeDatabase()}catch{} } });
@@ -94,6 +97,82 @@ test("ответ «Другое» принимает свой текст и со
   } finally { x.close(); }
 });
 
+test("регистрация ограничивает длину города, email и своего источника и сохраняет допустимую границу", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("ТестовоеИмя")); await x.send(message("ТестоваяФамилия")); await x.send(contact(userId));
+    const tooLongCity=await x.send(message("Г".repeat(101))); assert.match(tooLongCity,/100 символов/);
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"city"); assert.equal(x.db.getDraft("telegram",userId).answers.city,undefined);
+    await x.send(message("Г".repeat(100))); assert.equal(x.db.getDraft("telegram",userId).answers.city,"Г".repeat(100));
+    assert.match(await x.send(message("не email")),/корректный email/);
+    const maxEmail=`${"a".repeat(248)}@x.com`; await x.send(message(maxEmail)); assert.equal(x.db.getDraft("telegram",userId).answers.email,maxEmail);
+    await x.send(message("Telegram")); await x.send(message("Другое"));
+    assert.match(await x.send(message("И".repeat(121))),/120 символов/);
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"referral_source");
+    await x.send(message("И".repeat(120))); assert.equal(x.db.getDraft("telegram",userId).answers.referral_source,"И".repeat(120));
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")),/Регистрация завершена/);
+    const saved=x.db.findParticipantByTelegramId(userId); assert.equal(saved.city,"Г".repeat(100)); assert.equal(saved.email,maxEmail); assert.equal(saved.referral_source,"И".repeat(120));
+  } finally {x.close();}
+});
+
+test("назад на шаге телефона возвращает к фамилии, не принимает кнопку за номер", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Имя")); await x.send(message("Фамилия"));
+    assert.match(await x.send(message("⬅️ Назад")),/фамилию/i);
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"last_name");
+    await x.send(message("НоваяФамилия")); assert.equal(x.db.getDraft("telegram",userId).current_step,"phone");
+    await x.send(message("⬅️ Назад")); assert.equal(x.db.getDraft("telegram",userId).current_step,"last_name");
+  } finally {x.close();}
+});
+
+test("возврат из своего варианта источника сбрасывает ожидание текста и позволяет выбрать снова", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Имя")); await x.send(message("Фамилия")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("Другое"));
+    assert.match(await x.send(message("⬅️ Назад")),/Откуда вы узнали/);
+    const draft=x.db.getDraft("telegram",userId); assert.equal(draft.current_step,"referral_source"); assert.equal(draft.answers.awaiting_referral_detail,undefined);
+    await x.send(message("Пропустить"));
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"confirm"); assert.equal(x.db.getDraft("telegram",userId).answers.referral_source,null);
+  } finally {x.close();}
+});
+
+test("после заполнения анкеты можно исправить поле, вернуться к сводке и подтвердить", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Имя")); await x.send(message("Фамилия")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("Пропустить"));
+    await x.send(message("✏️ Исправить данные")); await x.send(message("Город"));
+    const corrected=await x.send(message("Тестоград")); assert.match(corrected,/Город: Тестоград/);
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"confirm");
+    await x.send(message("✏️ Исправить данные"));
+    const summary=await x.send(message("⬅️ Назад")); assert.match(summary,/Проверьте ваши данные/); assert.match(summary,/Город: Тестоград/);
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")),/Регистрация завершена/);
+    assert.equal(x.db.findParticipantByTelegramId(userId).city,"Тестоград");
+  } finally {x.close();}
+});
+
+test("настоящая регистрация возвращается из ввода Другое и предлагает варианты источника", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Имя")); await x.send(message("Фамилия")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("Другое"));
+    assert.match(await x.send(message("⬅️ Назад")),/Откуда вы узнали/);
+    const draft=x.db.getDraft("telegram",userId); assert.equal(draft.current_step,"referral_source"); assert.equal(draft.answers.awaiting_referral_detail,undefined);
+    await x.send(message("Мероприятие")); assert.equal(x.db.getDraft("telegram",userId).answers.referral_source,"Мероприятие");
+    assert.equal(x.db.getDraft("telegram",userId).current_step,"confirm");
+  } finally {x.close();}
+});
+
+test("черновик регистрации не позволяет очистить email, выбранный способом связи", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Имя")); await x.send(message("Фамилия")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("email@example.invalid")); await x.send(message("Электронная почта")); await x.send(message("Пропустить"));
+    await x.send(message("✏️ Исправить данные")); await x.send(message("Электронная почта"));
+    const denied=await x.send(message("Пропустить")); assert.match(denied,/Сначала измените предпочтительный способ связи/);
+    const draft=x.db.getDraft("telegram",userId); assert.equal(draft.current_step,"email"); assert.equal(draft.answers.email,"email@example.invalid");
+    await x.send(message("⬅️ Назад"));
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")),/Регистрация завершена/);
+    assert.equal(x.db.findParticipantByTelegramId(userId).email,"email@example.invalid");
+  } finally {x.close();}
+});
+
 test("выбор конкретного поля меняет только фамилию и возвращает к сводке", async () => {
   const x=setup(); try {
     await x.send(message("Зарегистрироваться")); await x.send(message("Согласен")); await x.send(message("Мария")); await x.send(message("Старая")); await x.send(contact(userId)); await x.send(message("Казань")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("От друзей или знакомых"));
@@ -113,5 +192,67 @@ test("изменённый ответ анкеты сохраняется пос
   } finally { try{x.db.closeDatabase()}catch{} }
 });
 
+test("черновик нельзя продолжить или подтвердить, если политика стала недоступна", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться"));
+    await x.send(message("Согласен"));
+    await x.send(message("Тест"));
+    const before = x.db.getDraft("telegram", userId);
+    delete process.env.PRIVACY_POLICY_URL;
+    assert.match(await x.send(message("ТестоваяФамилия")), /PRIVACY_POLICY_URL/);
+    assert.deepEqual(x.db.getDraft("telegram", userId), before);
+
+    const answers = { ...before.answers, first_name: "Тест", last_name: "ТестоваяФамилия", phone: "+79001234567", phone_confirmed_at: new Date().toISOString(), phone_confirmed_by: String(userId), preferred_contact: "Telegram", personal_data_consent: true, consent_at: new Date().toISOString(), consent_version: "test-policy-v1", consent_given_by: String(userId) };
+    x.db.saveDraft("telegram", userId, "confirm", answers);
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")), /PRIVACY_POLICY_URL/);
+    assert.equal(x.db.getParticipantCount(), 0);
+    assert.ok(x.db.getDraft("telegram", userId));
+    assert.match(await x.send(message("❌ Отменить регистрацию")), /отменена/i);
+    assert.equal(x.db.getDraft("telegram", userId), undefined);
+  } finally { x.close(); }
+});
+
+test("черновик с устаревшей версией политики сохраняется, но не завершается", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен"));
+    await x.send(message("Тест")); await x.send(message("Фамилия")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("Пропустить"));
+    const before = x.db.getDraft("telegram", userId);
+    process.env.PRIVACY_POLICY_VERSION = "test-policy-v2";
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")), /версия политики изменилась/i);
+    assert.equal(x.db.getParticipantCount(), 0);
+    assert.deepEqual(x.db.getDraft("telegram", userId), before);
+  } finally { x.close(); }
+});
+
+test("обычная регистрация полностью блокируется в demo-режиме без записи и без изменения черновика", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться"));
+    const before = x.db.getDraft("telegram", userId);
+    process.env.DEMO_MODE = "true";
+    assert.match(await x.send(message("Зарегистрироваться")), /отключена в демонстрационном режиме/i);
+    assert.match(await x.send(message("Согласен")), /отключена в демонстрационном режиме/i);
+    assert.deepEqual(x.db.getDraft("telegram", userId), before);
+    const forged = { ...before.answers, first_name: "Тест", last_name: "Демо", phone: "+79001234567", phone_confirmed_at: new Date().toISOString(), phone_confirmed_by: String(userId), preferred_contact: "Telegram", personal_data_consent: true, consent_at: new Date().toISOString(), consent_version: "test-policy-v1", consent_given_by: String(userId) };
+    x.db.saveDraft("telegram", userId, "confirm", forged);
+    assert.match(await x.send(message("✅ Подтвердить регистрацию")), /отключена в демонстрационном режиме/i);
+    assert.equal(x.db.getParticipantCount(), 0);
+    assert.equal(x.db.findParticipantByTelegramId(userId), undefined);
+  } finally { x.close(); }
+});
+
+test("повторное подтверждение готовой анкеты не создаёт дубликат", async () => {
+  const x=setup(); try {
+    await x.send(message("Зарегистрироваться")); await x.send(message("Согласен"));
+    await x.send(message("Тест")); await x.send(message("Пользователь")); await x.send(contact(userId));
+    await x.send(message("Пропустить")); await x.send(message("Пропустить")); await x.send(message("Telegram")); await x.send(message("Пропустить"));
+    assert.equal(x.db.getDraft("telegram", userId).current_step, "confirm");
+    await x.send(message("✅ Подтвердить регистрацию"));
+    assert.equal(x.db.getParticipantCount(), 1);
+    await x.send(message("✅ Подтвердить регистрацию"));
+    assert.equal(x.db.getParticipantCount(), 1);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM accounts WHERE platform='telegram' AND messenger_user_id=?").get(String(userId)).count, 1);
+  } finally { x.close(); }
+});
 
 

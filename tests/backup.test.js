@@ -4,9 +4,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const BetterSqlite3 = require("better-sqlite3");
-const { createBackupManager, verifyBackupFile, startAutomaticBackups, requiredTables } = require("../src/database/backup");
+const { createBackupManager, verifyBackupFile, restoreBackup, startAutomaticBackups, requiredTables } = require("../src/database/backup");
 const { createBackupFromDatabaseFile } = require("../src/database/backup-cli");
-const { readBackupSettings } = require("../src/database/config");
+const { readBackupSettings, classifyDatabasePath } = require("../src/database/config");
+const { createBaseSchema, migrateDatabase } = require("../src/database/migrations");
 
 function setupDatabase() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-backup-test-"));
@@ -59,6 +60,14 @@ test("создаёт проверенную копию, включая все т
     assert.equal(result.verified, true);
     assert.ok(fs.existsSync(result.path));
     assert.equal(verifyBackupFile(result.path), true);
+    assert.equal(result.metadata.schema_version, x.db.schemaVersion);
+    assert.equal(result.metadata.source_type, "production");
+    assert.equal(result.metadata.participants_count, 1);
+    assert.equal(result.metadata.accounts_count, 1);
+    assert.equal(result.metadata.admins_count, 2);
+    assert.match(result.metadata.sha256, /^[a-f0-9]{64}$/);
+    const manifestText = fs.readFileSync(result.metadataPath, "utf8");
+    assert.doesNotMatch(manifestText, /ТестовоеИмя|ВымышленнаяФамилия|synthetic@example|700000001|\+79990000001/);
     const copy = new BetterSqlite3(result.path, { readonly: true, fileMustExist: true });
     try {
       const tables = new Set(copy.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
@@ -93,6 +102,38 @@ test("созданная копия проходит integrity_check и соде
     assert.equal(verifyBackupFile(result.path), true);
     assert.match(result.filename, /^magic-morning-\d{8}T\d{6}\.\d{3}Z-[0-9a-f-]{36}\.sqlite$/i);
   } finally { x.close(); }
+});
+
+test("резервирование и восстановление работают, даже если ОС запрещает жёсткие ссылки", async () => {
+  const x = setupDatabase();
+  const originalLink = fs.linkSync;
+  try {
+    const participant = x.addFakeData();
+    fs.linkSync = () => { const error = new Error("hard links disabled by test filesystem"); error.code = "EPERM"; throw error; };
+    const backup = await x.manager().createBackup();
+    assert.equal(verifyBackupFile(backup.path, { requireMetadata: true }), true);
+    const destination = path.join(x.directory, "restored.sqlite");
+    const restored = restoreBackup(backup.path, destination);
+    assert.equal(restored.verified, true);
+    const copy = new BetterSqlite3(destination, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM participants").get().count, 1);
+      assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM accounts").get().count, 1);
+      assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM admins").get().count, 2);
+      assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM registration_drafts").get().count, 1);
+      assert.equal(copy.prepare("SELECT id FROM participants").get().id, participant.id);
+      assert.deepEqual(copy.prepare("PRAGMA integrity_check").all(), [{ integrity_check: "ok" }]);
+      assert.deepEqual(copy.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally { copy.close(); }
+
+    const occupied = path.join(x.directory, "occupied.sqlite");
+    fs.writeFileSync(occupied, "keep this unrelated file");
+    assert.throws(() => restoreBackup(backup.path, occupied), /уже занят/);
+    assert.equal(fs.readFileSync(occupied, "utf8"), "keep this unrelated file");
+  } finally {
+    fs.linkSync = originalLink;
+    x.close();
+  }
 });
 
 test("команда резервирования отказывается при отсутствии исходного файла и не создаёт пустую базу", async () => {
@@ -240,6 +281,92 @@ test("восстановление из копии возвращает учас
   }
 });
 
+test("интеграционный сценарий: копия старой схемы, миграция, восстановление и чтение связанных данных", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-migrate-backup-"));
+  const sourcePath = path.join(directory, "old-source.sqlite");
+  const backupDir = path.join(directory, "backups");
+  const sourceDb = new BetterSqlite3(sourcePath);
+  let restored;
+  try {
+    sourceDb.pragma("foreign_keys = ON");
+    createBaseSchema(sourceDb);
+    sourceDb.pragma("user_version = 1");
+    const person = sourceDb.prepare("INSERT INTO participants(first_name,last_name,phone,personal_data_consent) VALUES(?,?,?,?)").run("СинтетическоеИмя", "ПробнаяФамилия", "+99970000009", 1);
+    sourceDb.prepare("INSERT INTO accounts(participant_id,platform,messenger_user_id) VALUES(?,?,?)").run(person.lastInsertRowid, "telegram", "700000009");
+    sourceDb.prepare("INSERT INTO admins(telegram_id,role) VALUES(?,?)").run("700000010", "owner");
+    sourceDb.prepare("INSERT INTO registration_drafts(platform,messenger_user_id,current_step,answers_json) VALUES(?,?,?,?)").run("telegram", "700000011", "city", JSON.stringify({ first_name: "ЧерновоеИмя" }));
+
+    const manager = createBackupManager({ sourceDb, sourcePath, backupDir, sourceType: "production" });
+    const backup = await manager.createBackup();
+    assert.equal(backup.metadata.schema_version, 1);
+    assert.equal(verifyBackupFile(backup.path, { requireMetadata: true }), true);
+
+    migrateDatabase(sourceDb);
+    assert.equal(sourceDb.pragma("user_version", { simple: true }), 7);
+    assert.equal(sourceDb.prepare("SELECT first_name FROM participants WHERE id=?").get(person.lastInsertRowid).first_name, "СинтетическоеИмя");
+    assert.equal(sourceDb.prepare("SELECT COUNT(*) AS n FROM registration_drafts").get().n, 1);
+
+    const restoredPath = path.join(directory, "recovered", "recovered.sqlite");
+    const restoredResult = restoreBackup(backup.path, restoredPath);
+    assert.equal(restoredResult.verified, true);
+    assert.equal(verifyBackupFile(restoredPath, { requireMetadata: true }), true);
+    restored = new BetterSqlite3(restoredPath);
+    assert.equal(restored.pragma("user_version", { simple: true }), 1);
+    const readParticipant = restored.prepare("SELECT first_name,phone FROM participants WHERE id=?").get(person.lastInsertRowid);
+    assert.deepEqual(readParticipant, { first_name: "СинтетическоеИмя", phone: "+99970000009" });
+    assert.equal(restored.prepare("SELECT messenger_user_id FROM accounts WHERE participant_id=?").get(person.lastInsertRowid).messenger_user_id, "700000009");
+    assert.equal(restored.prepare("SELECT role FROM admins WHERE telegram_id='700000010'").get().role, "owner");
+    assert.equal(restored.prepare("SELECT current_step FROM registration_drafts WHERE messenger_user_id='700000011'").get().current_step, "city");
+    assert.deepEqual(restored.prepare("PRAGMA foreign_key_check").all(), []);
+    migrateDatabase(restored);
+    assert.equal(restored.pragma("user_version", { simple: true }), 7);
+    assert.equal(restored.prepare("SELECT first_name FROM participants WHERE phone=?").get("+99970000009").first_name, "СинтетическоеИмя");
+  } finally {
+    try { restored?.close(); } catch {}
+    try { sourceDb.close(); } catch {}
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("источник демонстрации нельзя обозначить рабочей базой", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-demo-backup-guard-"));
+  const demoDir = path.join(directory, "data");
+  fs.mkdirSync(demoDir);
+  const demoPath = path.join(demoDir, "demo.sqlite");
+  const demoDb = new BetterSqlite3(demoPath);
+  try {
+    createBaseSchema(demoDb);
+    migrateDatabase(demoDb);
+    const manager = createBackupManager({ sourceDb: demoDb, sourcePath: demoPath, backupDir: path.join(directory, "backups"), sourceType: "production", projectRoot: directory });
+    await assert.rejects(manager.createBackup(), /demo.sqlite нельзя|демонстрационная база не может/);
+    assert.equal(fs.existsSync(path.join(directory, "backups")), false);
+    assert.throws(() => classifyDatabasePath(demoPath, { projectRoot: directory }), /demo.sqlite нельзя/);
+    assert.equal(classifyDatabasePath(demoPath, { demoMode: "true", projectRoot: directory }), "demo");
+  } finally { demoDb.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("backup прекращается, если фактически открытый файл не совпадает с ожидаемым путём", async () => {
+  const x = setupDatabase();
+  const other = path.join(x.directory, "other.sqlite");
+  const otherDb = new BetterSqlite3(other);
+  try {
+    otherDb.exec("CREATE TABLE marker(value TEXT)");
+    const manager = createBackupManager({ sourceDb: x.db.db, sourcePath: other, backupDir: x.backupDir });
+    await assert.rejects(manager.createBackup(), /не совпадает с ожидаемым источником/);
+    assert.equal(fs.existsSync(x.backupDir), false);
+  } finally { otherDb.close(); x.close(); }
+});
+
+test("изменение файла после резервирования обнаруживается по размеру или checksum", async () => {
+  const x = setupDatabase();
+  try {
+    x.addFakeData();
+    const result = await x.manager().createBackup();
+    fs.appendFileSync(result.path, Buffer.from([0]));
+    assert.throws(() => verifyBackupFile(result.path, { requireMetadata: true }), /Контрольная сумма|размер/);
+  } finally { x.close(); }
+});
+
 test("параметры автоматического расписания поддерживают отключение и заданный интервал", async () => {
   let calls = 0;
   let callback;
@@ -313,3 +440,29 @@ test("тестовые записи вымышленные, а база нахо
   } finally { x.close(); }
 });
 
+test("остановка планировщика ждёт завершения уже начатой копии базы", async () => {
+  let resolveBackup;
+  let calls = 0;
+  let intervalCallback;
+  let intervalCleared = false;
+  const manager = { createBackup() {
+    calls += 1;
+    return new Promise((resolve) => { resolveBackup = resolve; });
+  } };
+  const stop = startAutomaticBackups(manager, {
+    intervalMs: 10,
+    logger: { info() {}, error() {} },
+    setIntervalFn(callback) { intervalCallback = callback; return { unref() {} }; },
+    clearIntervalFn() { intervalCleared = true; }
+  });
+  let stopped = false;
+  const stopping = stop().then(() => { stopped = true; });
+  await Promise.resolve();
+  assert.equal(intervalCleared, true);
+  assert.equal(stopped, false);
+  intervalCallback();
+  assert.equal(calls, 1);
+  resolveBackup();
+  await stopping;
+  assert.equal(stopped, true);
+});

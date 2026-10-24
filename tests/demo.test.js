@@ -170,8 +170,79 @@ test("команда генератора отказывается от рабо
 
 test("проверка готовности требует 150 участников и правильного владельца", () => withDemo(({ demoPath }) => {
   assert.deepEqual(verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), { count: 150, ownerConfigured: true });
-  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: "987654320" }), /не является владельцем/);
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: "987654320" }), /единственный настроенный владелец/i);
 }));
+
+test("проверка demo:start обнаруживает изменённые синтетические поля без исправления базы", () => withDemo(({ demoPath, db }) => {
+  db.db.prepare("UPDATE participants SET city='Изменённый город' WHERE id=1").run();
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /содержимое демонстрационной базы изменилось/i);
+  assert.equal(db.db.prepare("SELECT city FROM participants WHERE id=1").get().city, "Изменённый город");
+}));
+
+test("проверка demo:start обнаруживает лишнего участника и не удаляет его", () => withDemo(({ demoPath, db }) => {
+  db.addParticipant({ first_name: "ЛишнийТест", last_name: "Неизвестный", phone: "+79005550123" });
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /150 участников|содержимое|изменена/i);
+  assert.equal(db.getParticipantCount(), 151);
+}));
+
+test("проверка demo:start обнаруживает изменённую или лишнюю привязку аккаунта", () => withDemo(({ demoPath, db }) => {
+  db.db.prepare("UPDATE accounts SET messenger_user_id='DEMO-TG-ALTERED' WHERE id=(SELECT MIN(id) FROM accounts)").run();
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /аккаунты изменились/i);
+  assert.equal(db.db.prepare("SELECT COUNT(*) AS count FROM accounts WHERE messenger_user_id='DEMO-TG-ALTERED'").get().count, 1);
+}));
+
+test("проверка demo:start отклоняет дополнительную привязку, которой нет у генератора", () => withDemo(({ demoPath, db }) => {
+  db.linkAccount(1, "max", "DEMO-MAX-EXTRA");
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /аккаунты изменились/i);
+  assert.equal(db.db.prepare("SELECT COUNT(*) AS count FROM accounts WHERE messenger_user_id='DEMO-MAX-EXTRA'").get().count, 1);
+}));
+
+test("проверка совместима со старой схемой и остаётся только для чтения", () => withDemo(({ demoPath, db }) => {
+  db.db.exec("ALTER TABLE participants DROP COLUMN consent_version");
+  assert.deepEqual(verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), { count: 150, ownerConfigured: true });
+  assert.equal(db.db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_version"), false);
+}));
+
+test("изменение username владельца не влияет на проверку неизменяемых демоданных", () => withDemo(({ demoPath, db }) => {
+  db.updateAdminUsername(ownerId, "test_owner"); // Username является изменяемым отображаемым атрибутом.
+  assert.deepEqual(verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), { count: 150, ownerConfigured: true });
+}));
+
+test("после штатного добавления администратора проверка демобазы проходит без выдачи новых ролей", () => withDemo(({ demoPath, db }) => {
+  db.addAdmin("123123123");
+  assert.equal(db.getAdminRole("123123123"), "admin");
+  assert.deepEqual(verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), { count: 150, ownerConfigured: true });
+  assert.equal(db.getAdminRole(ownerId), "owner");
+}));
+
+test("после штатного удаления администратора проверка демобазы проходит", () => withDemo(({ demoPath, db }) => {
+  db.addAdmin("123123123");
+  assert.equal(db.removeAdmin("123123123"), true);
+  assert.equal(db.getAdminRole("123123123"), null);
+  assert.deepEqual(verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), { count: 150, ownerConfigured: true });
+}));
+
+test("проверка администраторов отклоняет неизвестную запись и не меняет таблицу", () => withDemo(({ demoPath, db }) => {
+  db.db.prepare("INSERT INTO admins(telegram_id,role) VALUES(?,'admin')").run("not-a-telegram-id");
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /некорректная запись/i);
+  assert.equal(db.db.prepare("SELECT COUNT(*) AS count FROM admins").get().count, 2);
+  assert.equal(db.getAdminRole(ownerId), "owner");
+}));
+
+test("проверка не принимает второго владельца вместо единственного настроенного", () => withDemo(({ demoPath, db }) => {
+  db.db.prepare("INSERT INTO admins(telegram_id,role) VALUES(?,'owner')").run("222333444");
+  assert.throws(() => verifyDemoDatabase({ databasePath: demoPath, ownerTelegramId: ownerId }), /единственный настроенный владелец/i);
+  assert.equal(db.db.prepare("SELECT COUNT(*) AS count FROM admins WHERE role='owner'").get().count, 2);
+}));
+
+test("verifyDemoDatabase отказывается проверять путь рабочей базы", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "magic-demo-path-"));
+  try {
+    const workingPath = path.join(dir, "club.sqlite");
+    assert.throws(() => verifyDemoDatabase({ databasePath: workingPath, productionDatabasePath: workingPath, ownerTelegramId: ownerId }), /путь рабочей базы/i);
+    assert.equal(fs.existsSync(workingPath), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("настройка запуска выбирает только demo.sqlite, отключает backup и метит режим", () => {
   const { configureDemoEnvironment } = require("../src/demo/start");

@@ -3,9 +3,41 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { createRequire } = require("node:module");
 const ExcelJS = require("exceljs");
 const { InputFile, Bot } = require("grammy");
 const exportModule = require("../src/excel-export");
+
+test("переопределённый uuid сохраняет CommonJS API, нужный ExcelJS", async () => {
+  const excelRequire = createRequire(require.resolve("exceljs"));
+  const uuidEntry = excelRequire.resolve("uuid");
+  const uuidPackagePath = path.resolve(path.dirname(uuidEntry), "..", "..", "package.json");
+  const uuidPackage = JSON.parse(fs.readFileSync(uuidPackagePath, "utf8"));
+  assert.equal(uuidPackage.version, "11.1.1");
+  assert.match(excelRequire("uuid").v4(), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+
+  const buffer = await exportModule.createParticipantsWorkbook([{
+    id: "900000000001",
+    first_name: "Ёлка",
+    last_name: "Тестовая",
+    phone: "+79991234567",
+    city: null,
+    email: null,
+    preferred_contact: "Telegram",
+    referral_source: null,
+    registered_at: "2026-10-24T10:00:00.000Z",
+    telegram_id: "700000001",
+    max_id: null,
+    phone_confirmed_at: "2026-10-24T10:00:00.000Z",
+    consent_at: null
+  }]);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const sheet = workbook.getWorksheet("Участники");
+  assert.equal(sheet.getRow(2).getCell(2).value, "Ёлка");
+  assert.equal(sheet.getRow(2).getCell(4).value, "+79991234567");
+  assert.equal(sheet.getRow(2).getCell(2).type, ExcelJS.ValueType.String);
+});
 
 function setup() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "magic-excel-test-"));
@@ -128,6 +160,39 @@ test("выгрузка требует подтверждения, отправл
   } finally { x.close(); }
 });
 
+test("одновременные подтверждения Excel не запускают две тяжёлые выгрузки", async () => {
+  const original = exportModule.createParticipantsWorkbook;
+  let callCount = 0;
+  let release;
+  exportModule.createParticipantsWorkbook = (rows) => {
+    callCount += 1;
+    return new Promise((resolve, reject) => {
+      release = async () => {
+        try { resolve(await original(rows)); } catch (error) { reject(error); }
+      };
+    });
+  };
+  const x = setup();
+  try {
+    x.add(1);
+    x.db.addAdmin("70002");
+    await x.send("📥 Скачать Excel", 70001);
+    await x.send("📥 Скачать Excel", 70002);
+    const sendFirst = x.send("✅ Подтвердить выгрузку", 70001);
+    for (let attempt = 0; attempt < 20 && !release; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof release, "function");
+    const second = await x.send("✅ Подтвердить выгрузку", 70002);
+    assert.match(second.payload.text, /Другая выгрузка уже выполняется/);
+    assert.equal(callCount, 1);
+    await release();
+    await sendFirst;
+    assert.equal(x.sent.filter((item) => item.method === "sendDocument").length, 1);
+  } finally {
+    exportModule.createParticipantsWorkbook = original;
+    x.close();
+  }
+});
+
 test("отмена не отправляет файл; обычный пользователь и группа не могут подтвердить экспорт", async () => {
   const x = setup();
   try {
@@ -152,16 +217,67 @@ test("подтверждение повторно проверяет роль и
     x.db.db.prepare("DELETE FROM admins WHERE telegram_id=?").run("70001");
     assert.match((await x.send("✅ Подтвердить выгрузку")).payload.text, /нет доступа/);
     assert.equal(x.sent.some((item) => item.method === "sendDocument"), false);
-
-    x.db.initializeOwner("70001");
-    await x.send("📥 Скачать Excel");
-    x.add(2);
-    assert.match((await x.send("✅ Подтвердить выгрузку")).payload.text, /Количество участников изменилось/);
-    assert.equal(x.sent.some((item) => item.method === "sendDocument"), false);
   } finally { x.close(); }
+
+  const y = setup();
+  try {
+    y.add(1);
+    await y.send("📥 Скачать Excel");
+    y.add(2);
+    assert.match((await y.send("✅ Подтвердить выгрузку")).payload.text, /Количество участников изменилось/);
+    assert.equal(y.sent.some((item) => item.method === "sendDocument"), false);
+  } finally { y.close(); }
+});
+
+test("отзыв согласия после начала формирования Excel не приводит к отправке устаревшей анкеты", async () => {
+  const original = exportModule.createParticipantsWorkbook;
+  let release;
+  exportModule.createParticipantsWorkbook = (rows) => new Promise((resolve, reject) => {
+    release = async () => { try { resolve(await original(rows)); } catch (error) { reject(error); } };
+  });
+  const x = setup();
+  try {
+    const participant = x.add(31, { last_name: "Тестовая", personal_data_consent: true, consent_at: "2026-10-20T00:00:00.000Z", consent_version: "synthetic-v1" });
+    await x.send("📥 Скачать Excel");
+    const confirming = x.send("✅ Подтвердить выгрузку");
+    for (let attempt = 0; attempt < 30 && !release; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof release, "function");
+    const withdrawnAt = new Date().toISOString();
+    x.db.db.prepare("UPDATE participants SET personal_data_consent=0, consent_withdrawn_at=?, updated_at=? WHERE id=?").run(withdrawnAt, withdrawnAt, participant.id);
+    await release();
+    await confirming;
+    assert.equal(x.sent.some((item) => item.method === "sendDocument"), false);
+    assert.match(x.sent.at(-1).payload.text, /изменились во время формирования/);
+  } finally {
+    exportModule.createParticipantsWorkbook = original;
+    x.close();
+  }
+});
+
+test("права администратора перепроверяются после асинхронного формирования Excel", async () => {
+  const original = exportModule.createParticipantsWorkbook;
+  let release;
+  exportModule.createParticipantsWorkbook = (rows) => new Promise((resolve, reject) => {
+    release = async () => { try { resolve(await original(rows)); } catch (error) { reject(error); } };
+  });
+  const x = setup();
+  try {
+    x.add(32);
+    await x.send("📥 Скачать Excel");
+    const confirming = x.send("✅ Подтвердить выгрузку");
+    for (let attempt = 0; attempt < 30 && !release; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof release, "function");
+    x.db.db.prepare("DELETE FROM admins WHERE telegram_id=?").run("70001");
+    await release();
+    await confirming;
+    assert.equal(x.sent.some((item) => item.method === "sendDocument"), false);
+    assert.match(x.sent.at(-1).payload.text, /доступ к выгрузке отозван/i);
+  } finally {
+    exportModule.createParticipantsWorkbook = original;
+    x.close();
+  }
 });
 
 test("имя файла использует заданную календарную дату", () => {
   assert.equal(exportModule.getExportFilename(new Date(2026, 9, 23)), "Магия_утра_участники_2026-10-23.xlsx");
 });
-

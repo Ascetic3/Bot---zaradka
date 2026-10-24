@@ -148,3 +148,49 @@ test("настоящая регистрация всё ещё требует PRI
     assert.equal(x.db.getDraft("telegram", ownerId), undefined);
   } finally { x.close(); }
 });
+
+test("кнопка Назад на шаге тестового телефона возвращает к фамилии", async () => {
+  const x=setup(); try {
+    await x.send("/preview_registration"); await x.send("Аня"); await x.send("Смирнова");
+    const back=await x.send("⬅️ Назад");
+    assert.match(back.text,/фамилию/i);
+    assert.ok(back.reply_markup.keyboard.flat().some((button) => button.text === "⬅️ Назад"));
+    assert.match((await x.send("НоваяФамилия")).text,/Поделитесь номером телефона/);
+    const phone=await x.send("🧪 Использовать тестовый номер");
+    assert.match(phone.text,/В каком городе/);
+    assert.match((await x.send("Пропустить")).text,/электронную почту/);
+  } finally { x.close(); }
+});
+
+test("Назад из своего варианта снимает флаг ожидания и позволяет выбрать источник повторно", async () => {
+  const x=setup(); try {
+    await x.send("/preview_registration"); await x.send("Анна"); await x.send("Смирнова"); await x.send("🧪 Использовать тестовый номер");
+    await x.send("Пропустить"); await x.send("Пропустить"); await x.send("Telegram"); await x.send("Другое");
+    const choices=await x.send("⬅️ Назад");
+    assert.match(choices.text,/Откуда вы узнали/);
+    assert.ok(choices.reply_markup.keyboard.flat().some((button) => button.text === "Другое"));
+    const summary=await x.send("Пропустить");
+    assert.match(summary.text,/Откуда узнали о клубе: Не указано/);
+    assert.match(summary.text,/Это предварительный просмотр\. Анкета не будет сохранена/);
+  } finally { x.close(); }
+});
+
+test("в предварительном просмотре можно отменить и запустить анкету заново", async () => {
+  const x=setup(); try {
+    await x.send("/preview_registration"); await x.send("СтароеИмя");
+    const cancelled=await x.send("❌ Отмена"); assert.match(cancelled.text,/отменён/);
+    assert.equal(x.db.getParticipantCount(),0); assert.equal(x.db.getDraft("telegram",ownerId),undefined);
+    const restarted=await x.send("/preview_registration"); assert.match(restarted.text,/Как вас зовут/);
+    assert.match((await x.send("НовоеИмя")).text,/Введите вашу фамилию/);
+  } finally { x.close(); }
+});
+
+test("Назад при выборе поля исправления возвращает к неизменённой сводке", async () => {
+  const x=setup(); try {
+    await reachSummary(x.send); await x.send("✏️ Исправить данные");
+    const summary=await x.send("⬅️ Назад");
+    assert.match(summary.text,/Предварительный просмотр анкеты/);
+    assert.match(summary.text,/Имя: Анна/);
+    assert.equal(x.db.getParticipantCount(),0);
+  } finally { x.close(); }
+});

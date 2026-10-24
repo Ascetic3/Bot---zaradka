@@ -3,8 +3,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
 const { Bot } = require("grammy");
+const { createBaseSchema, migrateDatabase } = require("../src/database/migrations");
+const Database = require("better-sqlite3");
 
 function setup() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "magic-search-admin-"));
@@ -96,12 +97,18 @@ test("username обновляется при взаимодействии адм
   } finally { x.close(); }
 });
 
-test("старая схема admins автоматически получает username без потери администраторов", () => {
+test("явная миграция старой полной схемы добавляет username без потери администраторов", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "magic-legacy-admins-"));
   const file = path.join(dir, "legacy.sqlite");
-  const modulePath = path.resolve(__dirname, "../src/database/index.js");
-  const result = spawnSync(process.execPath, ["-e", `const Database=require('better-sqlite3');const db=new Database(process.env.DB_PATH);db.exec("CREATE TABLE admins (telegram_id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('owner','admin')), added_at TEXT NOT NULL DEFAULT 'legacy'); INSERT INTO admins(telegram_id,role) VALUES('10001','owner');");db.close();const d=require(process.env.MODULE_PATH);const columns=d.db.prepare('PRAGMA table_info(admins)').all();if(!columns.some(c=>c.name==='username'))process.exit(2);const row=d.listAdmins()[0];if(row.telegram_id!=='10001'||row.role!=='owner'||row.username!==null)process.exit(3);if(d.getAdminRole('10001')!=='owner'||d.getAdminRole('other')!==null)process.exit(4);d.closeDatabase();`], { env: { ...process.env, DB_PATH: file, MODULE_PATH: modulePath }, encoding: "utf8" });
-  try { assert.equal(result.status, 0, result.stderr); }
-  finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  const db = new Database(file);
+  try {
+    createBaseSchema(db);
+    db.pragma("user_version = 1");
+    db.prepare("INSERT INTO admins(telegram_id,role) VALUES(?,?)").run("10001", "owner");
+    migrateDatabase(db);
+    const columns = db.prepare("PRAGMA table_info(admins)").all();
+    assert.ok(columns.some((column) => column.name === "username"));
+    const row = db.prepare("SELECT telegram_id,role,username FROM admins").get();
+    assert.deepEqual(row, { telegram_id: "10001", role: "owner", username: null });
+  } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
-

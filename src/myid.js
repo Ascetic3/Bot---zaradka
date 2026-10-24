@@ -1,7 +1,9 @@
 const { isPrivateChat } = require("./chat-guards");
+const { createRateLimiter, allowRequest } = require("./request-limits");
 
-function registerMyId(bot) {
+function registerMyId(bot, { rateLimiter = createRateLimiter() } = {}) {
   bot.command("myid", async (ctx) => {
+    if (!(await allowRequest(ctx, rateLimiter, "command_myid"))) return;
     if (!isPrivateChat(ctx)) {
       return ctx.reply("Команда /myid доступна только в личном чате с ботом.");
     }
@@ -9,4 +11,3 @@ function registerMyId(bot) {
   });
 }
 module.exports = { registerMyId };
-

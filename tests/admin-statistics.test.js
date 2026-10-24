@@ -104,3 +104,15 @@ test("длинное распределение ограничивается д�
   } finally { x.close(); }
 });
 
+test("статистика безопасно сокращает длинные категории только для показа", async () => {
+  const x=setup(); try {
+    const city="Г".repeat(6000), source="И".repeat(6000);
+    const participant=x.add({city,referral_source:source,preferred_contact:"Telegram"},1);
+    const message=await x.send("📊 Статистика");
+    assert.ok(message.text.length < 4096, `длина сообщения: ${message.text.length}`);
+    assert.ok(message.text.includes(`${"Г".repeat(80)}: 1`));
+    assert.ok(message.text.includes(`${"И".repeat(80)}: 1`));
+    assert.equal(x.db.getParticipant(participant.id).city,city);
+    assert.equal(x.db.getParticipant(participant.id).referral_source,source);
+  } finally {x.close();}
+});

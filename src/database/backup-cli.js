@@ -1,12 +1,15 @@
 const fs = require("node:fs");
+const path = require("node:path");
 const Database = require("better-sqlite3");
-const { getDatabasePath, readBackupSettings } = require("./config");
+const { getDatabasePath, readBackupSettings, classifyDatabasePath } = require("./config");
 const { createBackupManager } = require("./backup");
 
 async function createBackupFromDatabaseFile({
   databasePath = getDatabasePath(),
   backupDir = readBackupSettings().backupDir,
   retentionCount = readBackupSettings().retentionCount,
+  demoMode = process.env.DEMO_MODE,
+  projectRoot = path.resolve(__dirname, "../.."),
   DatabaseConstructor = Database
 } = {}) {
   if (!fs.existsSync(databasePath) || !fs.statSync(databasePath).isFile()) {
@@ -15,9 +18,10 @@ async function createBackupFromDatabaseFile({
     error.code = "SOURCE_DB_NOT_FOUND";
     throw error;
   }
+  const sourceType = classifyDatabasePath(databasePath, { demoMode, projectRoot });
   const sourceDb = new DatabaseConstructor(databasePath, { readonly: true, fileMustExist: true, timeout: 5000 });
   try {
-    const manager = createBackupManager({ sourceDb, sourcePath: databasePath, backupDir, retentionCount });
+    const manager = createBackupManager({ sourceDb, sourcePath: databasePath, backupDir, retentionCount, sourceType, projectRoot });
     return await manager.createBackup();
   } finally {
     sourceDb.close();
@@ -30,6 +34,7 @@ async function main() {
   try {
     const result = await createBackupFromDatabaseFile({ backupDir: settings.backupDir, retentionCount: settings.retentionCount });
     console.log(`Резервная копия создана и проверена: ${result.path}`);
+    console.log(`Метаданные (тип источника ${result.metadata.source_type}, схема ${result.metadata.schema_version}): ${result.metadataPath}`);
   } catch (error) {
     if (error?.code === "SOURCE_DB_NOT_FOUND") {
       console.error("Ошибка: рабочая SQLite-база не найдена. Проверьте DB_PATH и наличие файла базы.");
@@ -44,4 +49,3 @@ async function main() {
 if (require.main === module) main();
 
 module.exports = { createBackupFromDatabaseFile };
-

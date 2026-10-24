@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/bot.js",
     "backup": "node src/database/backup-cli.js",
+    "db:restore": "node src/database/restore-cli.js",
     "test": "node --test",
+    "db:migrate": "node src/database/migrate-cli.js",
     "demo:seed": "node src/demo/seed-cli.js",
     "demo:start": "node src/demo/start.js"
   },
@@ -16,6 +18,10 @@
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "grammy": "^1.35.0"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
   }
 }
-
