@@ -19,7 +19,7 @@ const otherMenuActions = new Set([
   "Моя анкета", "✏️ Изменить данные", "🏠 Главное меню",
   "🔎 Найти участника", "👥 Все участники", "📊 Статистика", "📥 Скачать Excel",
   "⚙️ Управление администраторами", "📋 Список администраторов", "➕ Добавить администратора",
-  "➖ Удалить администратора", "⬅️ В меню администратора", "⬅️ Админ-меню",
+  "➖ Удалить администратора", "⬅️ В меню администратора", "⬅️ Админ-меню", "Отмена",
   "🔄 Обновить статистику", "✅ Подтвердить выгрузку", "⬅️ Назад", "➡️ Далее", "🏠 Админ-меню"
 ]);
 const menu = (step) => {
@@ -47,13 +47,15 @@ function registerRegistration(bot) {
     if (!ctx.from || (!ctx.message.text && !ctx.message.contact)) return next();
     // Команды должны дойти до своих обработчиков, а не стать ответом на вопрос анкеты.
     if (ctx.message.text && /^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(ctx.message.text.trim())) return next();
+    const text = ctx.message.text?.trim();
     const uid = ctx.from.id;
     if (!isPrivateChat(ctx)) {
-      const text = ctx.message.text?.trim();
       if (otherMenuActions.has(text)) return next();
       if (ctx.message.contact || db.hasDraft("telegram", uid)) return ctx.reply("🔒 Регистрация доступна только в личном чате.\n\nОткройте @magia_utra_club_bot, чтобы зарегистрироваться.");
       return next();
     }
+    // Обычную отмену обрабатывают админ-панель и редактирование профиля.
+    if (text === "Отмена") return next();
     const draft = db.getDraft("telegram", uid);
     if (!draft) return next();
     if (draft.current_step.startsWith("profile_edit")) return next();

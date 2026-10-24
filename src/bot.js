@@ -3,7 +3,7 @@ const { Bot } = require("grammy");
 const { registerRegistration } = require("./registration");
 const { registerRegistrationPreview } = require("./registration-preview");
 const { registerProfile } = require("./profile");
-const { registerAdmin } = require("./admin");
+const { registerAdmin, registerAdminUsernameRefresh } = require("./admin");
 const { registerMyId } = require("./myid");
 const { registerPrivateCallbackGuard } = require("./chat-guards");
 const { registerStart } = require("./main-menu");
@@ -20,6 +20,7 @@ if (!token) {
 
 const bot = new Bot(token);
 bot.catch(handleBotError);
+registerAdminUsernameRefresh(bot);
 registerPrivateCallbackGuard(bot);
 registerStart(bot);
 const backupSettings = readBackupSettings();
@@ -32,11 +33,13 @@ const backupManager = createBackupManager({
 
 registerMyId(bot);
 
+// Register admin handlers before registration flows so active drafts cannot
+// consume administrator buttons or search queries as questionnaire answers.
+registerAdmin(bot);
+
 registerRegistrationPreview(bot);
 
 registerRegistration(bot);
-
-registerAdmin(bot);
 
 registerProfile(bot);
 

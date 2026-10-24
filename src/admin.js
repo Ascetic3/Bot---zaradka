@@ -5,10 +5,22 @@ const { createParticipantsWorkbook, getExportFilename } = require("./excel-expor
 const pending = new Map();
 const participantViews = new Map();
 const exportConfirmations = new Map();
+const usernameMiddlewareRegistered = new WeakSet();
+const demoBanner = () => process.env.DEMO_MODE === "true" ? "🧪 Демонстрационный режим. Данные вымышленные\n\n" : "";
 const ownerMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("⚙️ Управление администраторами").row().text("🏠 Главное меню").resized();
 const adminMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("🏠 Главное меню").resized();
+const managementMenu = new Keyboard().text("📋 Список администраторов").row().text("➕ Добавить администратора").row().text("➖ Удалить администратора").row().text("⬅️ В меню администратора").resized();
 const privateChat = isPrivateChat;
 const role = (ctx) => privateChat(ctx) ? db.getAdminRole(ctx.from.id) : null;
+const showAdminMenu = (ctx) => {
+  const currentRole = role(ctx);
+  return ctx.reply(`${demoBanner()}Административное меню:`, { reply_markup: currentRole === "owner" ? ownerMenu : adminMenu });
+};
+const clearAdminFlow = (id) => {
+  participantViews.delete(id);
+  pending.delete(id);
+  exportConfirmations.delete(id);
+};
 const shortText = (value, max = 40) => String(value ?? "Не указано").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, max) || "Не указано";
 const fullParticipantText = (p) => {
   const value = (v, max = 150) => shortText(v, max);
@@ -20,13 +32,22 @@ const statisticsKeyboard = new Keyboard().text("🔄 Обновить стати
 function formatDistribution(rows) {
   return rows.map(({ category, count }) => `• ${category}: ${count}`).join("\n");
 }
+function registerAdminUsernameRefresh(bot) {
+  if (usernameMiddlewareRegistered.has(bot)) return;
+  usernameMiddlewareRegistered.add(bot);
+  bot.use(async (ctx, next) => {
+    if (ctx.from) db.updateAdminUsername(ctx.from.id, ctx.from.username ?? null);
+    return next();
+  });
+}
 function registerAdmin(bot) {
+  registerAdminUsernameRefresh(bot);
   db.initializeOwner(process.env.OWNER_TELEGRAM_ID);
   bot.command("admin", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Административная команда доступна только в личном чате с ботом.");
     const currentRole = role(ctx);
     if (!currentRole) return ctx.reply("У вас нет доступа к административному меню.");
-    return ctx.reply("Административное меню:", { reply_markup: currentRole === "owner" ? ownerMenu : adminMenu });
+    return showAdminMenu(ctx);
   });
   bot.hears("🔎 Найти участника", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Поиск доступен только в личном чате с ботом.");
@@ -78,12 +99,12 @@ function registerAdmin(bot) {
   bot.hears(managementButton, async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Управление доступно только в личном чате с ботом.");
     if (role(ctx) !== "owner") return ctx.reply("Только владелец может управлять администраторами.");
-    return ctx.reply("Управление администраторами:", { reply_markup: new Keyboard().text("📋 Список администраторов").row().text("➕ Добавить администратора").row().text("➖ Удалить администратора").row().text("⬅️ В меню администратора").resized() });
+    return ctx.reply("Управление администраторами:", { reply_markup: managementMenu });
   });
   bot.hears("📋 Список администраторов", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Действие доступно только в личном чате.");
     if (role(ctx) !== "owner") return ctx.reply("Недостаточно прав.");
-    const list = db.listAdmins().map((a) => `${a.role === "owner" ? "Владелец" : "Администратор"}: ${a.telegram_id}`).join("\n");
+    const list = db.listAdmins().map((a) => `${a.role === "owner" ? "👑 Владелец" : "🛡 Администратор"}\nID: ${a.telegram_id}\nTelegram: ${a.username ? `@${a.username.replace(/^@/, "")}` : "Ник не указан"}`).join("\n\n");
     return ctx.reply(list || "Список администраторов пуст.");
   });
   bot.hears("➕ Добавить администратора", async (ctx) => {
@@ -100,8 +121,8 @@ function registerAdmin(bot) {
   });
   bot.hears("⬅️ В меню администратора", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Действие доступно только в личном чате.");
-    const currentRole = role(ctx); if (!currentRole) return ctx.reply("У вас нет доступа.");
-    return ctx.reply("Административное меню:", { reply_markup: currentRole === "owner" ? ownerMenu : adminMenu });
+    if (!role(ctx)) return ctx.reply("У вас нет доступа.");
+    return showAdminMenu(ctx);
   });
   bot.hears("🏠 Главное меню", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Действие доступно только в личном чате.");
@@ -126,9 +147,8 @@ function registerAdmin(bot) {
   bot.hears("🔄 Обновить статистику", showStatistics);
   bot.hears("⬅️ Админ-меню", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Административные функции доступны только в личном чате.");
-    const currentRole = role(ctx);
-    if (!currentRole) return ctx.reply("У вас нет доступа к административному меню.");
-    return ctx.reply("Административное меню:", { reply_markup: currentRole === "owner" ? ownerMenu : adminMenu });
+    if (!role(ctx)) return ctx.reply("У вас нет доступа к административному меню.");
+    return showAdminMenu(ctx);
   });
   bot.hears("📥 Скачать Excel", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Выгрузка доступна только в личном чате с ботом.");
@@ -143,9 +163,24 @@ function registerAdmin(bot) {
     });
   });
   bot.hears("Отмена", async (ctx, next) => {
-    if (!privateChat(ctx) || !exportConfirmations.has(String(ctx.from.id))) return next();
-    exportConfirmations.delete(String(ctx.from.id));
-    return ctx.reply("Выгрузка отменена.", { reply_markup: adminMenu });
+    if (!privateChat(ctx)) return next();
+    const id = String(ctx.from.id);
+    const currentRole = role(ctx);
+    if (!exportConfirmations.has(id) && !participantViews.has(id) && !pending.has(id)) return next();
+    if (!currentRole) { clearAdminFlow(id); return ctx.reply("Доступ отозван."); }
+
+    // Handle cancellation directly before the generic text-state handler. This
+    // works for search input, results, pages, and participant details alike.
+    if (exportConfirmations.has(id)) {
+      exportConfirmations.delete(id);
+      return ctx.reply("Выгрузка отменена.", { reply_markup: currentRole === "owner" ? ownerMenu : adminMenu });
+    }
+    if (participantViews.has(id)) {
+      participantViews.delete(id);
+      return showAdminMenu(ctx);
+    }
+    pending.delete(id);
+    return ctx.reply("Действие отменено.", { reply_markup: managementMenu });
   });
   bot.hears("✅ Подтвердить выгрузку", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Выгрузку можно подтвердить только в личном чате с ботом.");
@@ -187,7 +222,10 @@ function registerAdmin(bot) {
     if (view) {
       if (!role(ctx)) { participantViews.delete(id); return ctx.reply("Доступ отозван."); }
       const text = ctx.message.text.trim();
-      if (text === "Отмена" || text === "🏠 Админ-меню") { participantViews.delete(id); const r = role(ctx); return ctx.reply("Административное меню:", { reply_markup: r === "owner" ? ownerMenu : adminMenu }); }
+      if (text === "🏠 Админ-меню") {
+        participantViews.delete(id);
+        return showAdminMenu(ctx);
+      }
       if (view.mode === "search") {
         if (!text) return ctx.reply("Введите имя, фамилию или телефон для поиска.");
         return renderSearchPage(ctx, text, 0);
@@ -210,7 +248,6 @@ function registerAdmin(bot) {
     if (!action) return next();
     if (role(ctx) !== "owner") { pending.delete(id); return ctx.reply("Доступ отозван: только владелец может управлять администраторами."); }
     const value = ctx.message.text.trim();
-    if (value === "Отмена") { pending.delete(id); return ctx.reply("Действие отменено."); }
     if (!/^\d+$/.test(value)) return ctx.reply("Telegram ID должен состоять только из цифр. Попробуйте ещё раз или напишите «Отмена».");
     if (value === id) return ctx.reply("Нельзя назначить или удалить самого себя через это действие.");
     if (action === "add") {
@@ -221,5 +258,5 @@ function registerAdmin(bot) {
     return ctx.reply(removed ? `Администратор ${value} удалён.` : "Администратор не найден. Владелец не может быть удалён.");
   });
 }
-module.exports = { registerAdmin };
+module.exports = { registerAdmin, registerAdminUsernameRefresh };
 

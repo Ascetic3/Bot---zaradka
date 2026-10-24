@@ -6,7 +6,10 @@ const { getDatabasePath } = require("./config");
 const dbPath = getDatabasePath();
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath, { timeout: 5000 });
-db.function("unicode_lower", { deterministic: true }, (value) => String(value ?? "").toLocaleLowerCase("ru-RU"));
+// Normalize only for comparisons: Russian ё and е are equivalent in participant search.
+// Latin e remains unchanged because the replacement applies only to Cyrillic ё.
+const normalizeSearchText = (value) => String(value ?? "").toLocaleLowerCase("ru-RU").replace(/ё/g, "е");
+db.function("unicode_lower", { deterministic: true }, normalizeSearchText);
 db.pragma("foreign_keys = ON");
 db.pragma("journal_mode = WAL");
 db.pragma("busy_timeout = 5000");
@@ -42,6 +45,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS admins (
   telegram_id TEXT PRIMARY KEY,
   role TEXT NOT NULL CHECK(role IN ('owner','admin')),
+  username TEXT,
   added_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS registration_drafts (
@@ -54,6 +58,10 @@ CREATE TABLE IF NOT EXISTS registration_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_participant ON accounts(participant_id);
 `);
+// Older databases may already have admins without the optional username column.
+if (!db.prepare("PRAGMA table_info(admins)").all().some((column) => column.name === "username")) {
+  db.exec("ALTER TABLE admins ADD COLUMN username TEXT");
+}
 
 function normalizePhone(phone) {
   const normalized = String(phone).replace(/[\s()-]/g, "");
@@ -82,7 +90,7 @@ function searchParticipants(query, limit = 50, offset = 0) {
   const isPhone = phoneDigits.length >= 7 && phoneDigits.length <= 15 && /^[+\d\s().-]+$/.test(term);
   const escaped = term.replace(/[\\%_]/g, "\\$&");
   if (isPhone) return db.prepare(`SELECT * FROM participants WHERE replace(phone,'+','')=? ORDER BY registered_at DESC,id DESC LIMIT ? OFFSET ?`).all(phoneDigits, safeLimit, safeOffset);
-  const pattern = `%${escaped.toLocaleLowerCase("ru-RU")}%`;
+  const pattern = `%${normalizeSearchText(escaped)}%`;
   return db.prepare(`SELECT * FROM participants WHERE unicode_lower(first_name) LIKE ? ESCAPE '\\' OR unicode_lower(COALESCE(last_name,'')) LIKE ? ESCAPE '\\' OR unicode_lower(first_name || ' ' || COALESCE(last_name,'')) LIKE ? ESCAPE '\\' ORDER BY registered_at DESC,id DESC LIMIT ? OFFSET ?`).all(pattern, pattern, pattern, safeLimit, safeOffset);
 }
 function listParticipants(limit = 10, offset = 0) {
@@ -119,7 +127,11 @@ function initializeOwner(telegramId) {
   const result = db.prepare("INSERT INTO admins(telegram_id,role) SELECT ?, 'owner' WHERE NOT EXISTS (SELECT 1 FROM admins WHERE role='owner')").run(String(telegramId));
   return result.changes > 0 || getAdminRole(telegramId) === "owner";
 }
-function listAdmins() { return db.prepare("SELECT telegram_id, role, added_at FROM admins ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, telegram_id").all(); }
+function updateAdminUsername(telegramId, username) {
+  const normalized = typeof username === "string" && username.trim() ? username.trim().replace(/^@/, "") : null;
+  return db.prepare("UPDATE admins SET username=? WHERE telegram_id=? AND username IS NOT ?").run(normalized, String(telegramId), normalized).changes > 0;
+}
+function listAdmins() { return db.prepare("SELECT telegram_id, role, username, added_at FROM admins ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, telegram_id").all(); }
 function addAdmin(telegramId) {
   if (!/^\d+$/.test(String(telegramId || ""))) throw new Error("Telegram ID должен состоять из цифр.");
   if (db.prepare("SELECT 1 FROM admins WHERE telegram_id=?").get(String(telegramId))) return false;
@@ -174,5 +186,5 @@ function getParticipantsForExport() {
     ORDER BY p.id ASC`).all();
 }
 function closeDatabase() { db.close(); }
-module.exports = { db, dbPath, normalizePhone, addParticipant, findParticipantByPhone, findParticipantByTelegramId, getParticipant, searchParticipants, listParticipants, updateParticipant, linkAccount, saveDraft, getDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, closeDatabase };
+module.exports = { db, dbPath, normalizePhone, addParticipant, findParticipantByPhone, findParticipantByTelegramId, getParticipant, searchParticipants, listParticipants, updateParticipant, linkAccount, saveDraft, getDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, updateAdminUsername, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, closeDatabase };
 

@@ -34,7 +34,8 @@ function filenameDate(now = new Date()) {
 }
 
 function getExportFilename(now = new Date()) {
-  return `Магия_утра_участники_${filenameDate(now)}.xlsx`;
+  const prefix = process.env.DEMO_MODE === "true" ? "ДЕМО_" : "";
+  return `${prefix}Магия_утра_участники_${filenameDate(now)}.xlsx`;
 }
 
 async function createParticipantsWorkbook(participants) {

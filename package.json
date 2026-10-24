@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/bot.js",
     "backup": "node src/database/backup-cli.js",
-    "test": "node --test"
+    "test": "node --test",
+    "demo:seed": "node src/demo/seed-cli.js",
+    "demo:start": "node src/demo/start.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
