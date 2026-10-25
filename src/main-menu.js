@@ -28,3 +28,4 @@ function registerStart(bot, { rateLimiter = createRateLimiter() } = {}) {
 }
 
 module.exports = { registerStart, mainMenuKeyboard, mainMenuText };
+

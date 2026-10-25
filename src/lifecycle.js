@@ -114,3 +114,4 @@ function installSignalHandlers(shutdown, emitter = process) {
 }
 
 module.exports = { createUpdateTracker, createGracefulShutdown, installSignalHandlers };
+

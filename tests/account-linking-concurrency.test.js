@@ -95,3 +95,4 @@ test("два SQLite-подключения одновременно не мог�
     })().catch(error => { console.error(error.stack); process.exitCode = 1; });
   `);
 });
+

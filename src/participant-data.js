@@ -1,6 +1,8 @@
 const crypto = require("node:crypto");
 const database = require("./database");
 const { ExpiringMap } = require("./expiring-map");
+const path = require("node:path");
+const { classifyDatabasePath } = require("./database/config");
 
 const CONFIRMATION_TTL_MS = 10 * 60_000;
 
@@ -9,7 +11,8 @@ function createParticipantDataService({
   now = () => new Date(),
   createToken = () => crypto.randomBytes(24).toString("base64url"),
   confirmations = new ExpiringMap(CONFIRMATION_TTL_MS),
-  isDemoMode = () => String(process.env.DEMO_MODE).toLowerCase() === "true"
+  isDemoMode = () => String(process.env.DEMO_MODE).toLowerCase() === "true",
+  projectRoot = path.resolve(__dirname, "..")
 } = {}) {
   const actorKey = (id) => {
     const value = String(id ?? "");
@@ -21,11 +24,12 @@ function createParticipantDataService({
     if (!new Set(["owner", "admin"]).has(role)) throw new Error("Недостаточно административных прав.");
     return role;
   };
-  const assertDataChangesEnabled = () => {
+  const assertDataChangesEnabled = (actorId, participantId = null) => {
     if (!isDemoMode()) return;
-    const error = new Error("Изменение и удаление синтетических анкет отключено в демонстрационном режиме.");
-    error.code = "DEMO_MODE_DATA_CHANGE_DISABLED";
-    throw error;
+    try { classifyDatabasePath(db.dbPath, { demoMode: "true", projectRoot }); }
+    catch { throw Object.assign(new Error("Действие остановлено: подключение к подтверждённой демобазе отсутствует."), { code: "DEMO_DATABASE_MISMATCH" }); }
+    const marked = participantId != null ? db.isDemoTestParticipant(participantId) : db.isDemoTestParticipantForTelegram(actorId);
+    if (!marked) throw Object.assign(new Error("Действия с демоданными разрешены только для специально помеченных тестовых анкет."), { code: "DEMO_MODE_DATA_CHANGE_DISABLED" });
   };
   const issue = (operation, actorId, participantId, details = {}) => {
     const token = createToken();
@@ -35,8 +39,8 @@ function createParticipantDataService({
   };
 
   function prepareOwnDeletion(telegramId) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const participant = db.findParticipantByTelegramIdIncludingWithdrawn(actorId);
     if (!participant) return { status: "not_found" };
     const impact = db.getParticipantDeletionPreview(participant.id);
@@ -44,22 +48,22 @@ function createParticipantDataService({
   }
 
   function confirmOwnDeletion(telegramId, token) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const pending = typeof token === "string" ? confirmations.get(token) : null;
     if (!pending || pending.operation !== "delete_own" || pending.actorId !== actorId) return { status: "invalid_or_expired_confirmation" };
     const participant = db.findParticipantByTelegramIdIncludingWithdrawn(actorId);
     confirmations.delete(token);
     if (!participant || Number(participant.id) !== pending.participantId) return { status: "not_found" };
-    const result = db.deleteParticipantById(pending.participantId);
+    const result = isDemoMode() ? db.deleteDemoTestParticipantById(pending.participantId, actorId, { projectRoot }) : db.deleteParticipantById(pending.participantId);
     return { status: result.deleted ? "deleted" : "not_found", impact: result };
   }
 
   // The self-service UI records a request for operator review. It deliberately
   // never calls deleteParticipantById; destructive execution remains separate.
   function prepareOwnDeletionRequest(telegramId) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const requests = db.getParticipantDataRequestsForTelegram(actorId);
     if (!requests) return { status: "not_found" };
     if (requests.deletion_request_status === "pending_review") {
@@ -71,8 +75,8 @@ function createParticipantDataService({
   }
 
   function confirmOwnDeletionRequest(telegramId, token) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const pending = typeof token === "string" ? confirmations.get(token) : null;
     if (!pending || pending.operation !== "delete_request" || pending.actorId !== actorId) return { status: "invalid_or_expired_confirmation" };
     const participant = db.findParticipantByTelegramIdIncludingWithdrawn(actorId);
@@ -85,23 +89,23 @@ function createParticipantDataService({
   }
 
   function prepareAdminDeletion(adminTelegramId, participantId) {
-    assertDataChangesEnabled();
     const actorId = actorKey(adminTelegramId);
     requireAdmin(actorId);
+    assertDataChangesEnabled(actorId, participantId);
     const impact = db.getParticipantDeletionPreview(participantId);
     if (!impact) return { status: "not_found" };
     return { status: "confirmation_required", confirmation_token: issue("delete_admin", actorId, impact.participant_id), impact };
   }
 
   function confirmAdminDeletion(adminTelegramId, token) {
-    assertDataChangesEnabled();
     const actorId = actorKey(adminTelegramId);
     const pending = typeof token === "string" ? confirmations.get(token) : null;
     if (!pending || pending.operation !== "delete_admin" || pending.actorId !== actorId) return { status: "invalid_or_expired_confirmation" };
     try { requireAdmin(actorId); }
     catch { confirmations.delete(token); throw new Error("Административные права отозваны."); }
     confirmations.delete(token);
-    const result = db.deleteParticipantById(pending.participantId);
+    assertDataChangesEnabled(actorId, pending.participantId);
+    const result = isDemoMode() ? db.deleteDemoTestParticipantById(pending.participantId, actorId, { projectRoot }) : db.deleteParticipantById(pending.participantId);
     return { status: result.deleted ? "deleted" : "not_found", impact: result };
   }
 
@@ -120,8 +124,8 @@ function createParticipantDataService({
   }
 
   function prepareOwnConsentWithdrawal(telegramId) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const participant = db.findParticipantByTelegramIdIncludingWithdrawn(actorId);
     if (!participant) return { status: "not_found" };
     const state = db.getParticipantConsentState(participant.id);
@@ -133,8 +137,8 @@ function createParticipantDataService({
   }
 
   function confirmOwnConsentWithdrawal(telegramId, token) {
-    assertDataChangesEnabled();
     const actorId = actorKey(telegramId);
+    assertDataChangesEnabled(actorId);
     const pending = typeof token === "string" ? confirmations.get(token) : null;
     if (!pending || pending.operation !== "withdraw_consent" || pending.actorId !== actorId) return { status: "invalid_or_expired_confirmation" };
     const participant = db.findParticipantByTelegramIdIncludingWithdrawn(actorId);
@@ -171,3 +175,4 @@ function createParticipantDataService({
 }
 
 module.exports = { createParticipantDataService, CONFIRMATION_TTL_MS };
+

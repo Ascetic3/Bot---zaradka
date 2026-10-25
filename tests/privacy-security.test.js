@@ -270,3 +270,4 @@ test("ошибка grammY распознаётся как техническая
   });
   assert.doesNotMatch(JSON.stringify(details), /sensitive|private payload/);
 });
+

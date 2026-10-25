@@ -311,3 +311,4 @@ function startAutomaticBackups(manager, { enabled = true, intervalMs = 24 * 60 *
 }
 
 module.exports = { createBackupManager, verifyBackupFile, restoreBackup, cleanupOldBackups, startAutomaticBackups, safeBackupError, BackupInProgressError, requiredTables, hashFile, readManifest, inspectBackupFile };
+

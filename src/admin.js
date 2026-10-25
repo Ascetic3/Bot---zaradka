@@ -1,4 +1,4 @@
-const { Keyboard, InputFile } = require("grammy");
+const { Keyboard, InlineKeyboard, InputFile } = require("grammy");
 const db = require("./database");
 const { isPrivateChat } = require("./chat-guards");
 const { createParticipantsWorkbook, getExportFilename } = require("./excel-export");
@@ -10,6 +10,7 @@ const exportConfirmations = new ExpiringMap(10 * 60_000);
 // Храним короткий маркер, чтобы распознать сообщения со старой Excel-клавиатуры
 // после истечения основного десятиминутного подтверждения.
 const exportPrompts = new ExpiringMap(24 * 60 * 60_000);
+const demoDeletionReviews = new ExpiringMap(10 * 60_000);
 const usernameMiddlewareRegistered = new WeakSet();
 const demoBanner = () => process.env.DEMO_MODE === "true" ? "🧪 Демонстрационный режим. Данные вымышленные\n\n" : "";
 const ownerMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("📋 Запросы участников").row().text("⚙️ Управление администраторами").row().text("🏠 Главное меню").resized();
@@ -41,9 +42,10 @@ const shortText = (value, max = 40) => String(value ?? "Не указано").re
 const fullParticipantText = (p) => {
   const value = (v, max = 150) => shortText(v, max);
   const date = p.registered_at && !Number.isNaN(new Date(p.registered_at).getTime()) ? new Date(p.registered_at).toLocaleDateString("ru-RU", { timeZone: "UTC" }) : "Не указано";
-  return `Анкета участника:\n\nИмя: ${value(p.first_name, 100)}\nФамилия: ${value(p.last_name, 100)}\nТелефон: ${value(p.phone, 32)}\nГород: ${value(p.city)}\nEmail: ${value(p.email)}\nПредпочтительный способ связи: ${value(p.preferred_contact, 80)}\nОткуда узнали о клубе: ${value(p.referral_source)}\nДата регистрации: ${date}`;
+  const demoTag = String(process.env.DEMO_MODE).toLowerCase() === "true" && db.isDemoTestParticipant(p.id) ? "🧪 ТЕСТОВАЯ АНКЕТА ДЕМОРЕЖИМА\n\n" : "";
+  return `${demoTag}Анкета участника:\n\nИмя: ${value(p.first_name, 100)}\nФамилия: ${value(p.last_name, 100)}\nТелефон: ${value(p.phone, 32)}\nГород: ${value(p.city)}\nEmail: ${value(p.email)}\nПредпочтительный способ связи: ${value(p.preferred_contact, 80)}\nОткуда узнали о клубе: ${value(p.referral_source)}\nДата регистрации: ${date}`;
 };
-const participantButton = (p) => `👤 ${p.id}: ${shortText(p.first_name, 20)} ${shortText(p.last_name, 20)}`;
+const participantButton = (p) => `${String(process.env.DEMO_MODE).toLowerCase() === "true" && db.isDemoTestParticipant(p.id) ? "🧪" : "👤"} ${p.id}: ${shortText(p.first_name, 20)} ${shortText(p.last_name, 20)}`;
 const statisticsKeyboard = new Keyboard().text("🔄 Обновить статистику").row().text("⬅️ Админ-меню").resized();
 function formatDistribution(rows) {
   // Категория может быть создана из пользовательского текста в SQLite.
@@ -58,7 +60,7 @@ function registerAdminUsernameRefresh(bot) {
     return next();
   });
 }
-function registerAdmin(bot, { rateLimiter = createRateLimiter() } = {}) {
+function registerAdmin(bot, { rateLimiter = createRateLimiter(), demoProjectRoot } = {}) {
   let activeExports = 0;
   registerAdminUsernameRefresh(bot);
   // Любая команда завершает ожидавшийся административный ввод, прежде чем
@@ -170,6 +172,11 @@ function registerAdmin(bot, { rateLimiter = createRateLimiter() } = {}) {
     clearAdminFlow(String(ctx.from.id));
     return next();
   });
+  bot.hears("🔐 Мои данные", async (ctx, next) => {
+    if (!privateChat(ctx)) return next();
+    clearAdminFlow(String(ctx.from.id));
+    return next();
+  });
   const showStatistics = async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Статистика доступна только в личном чате с ботом.");
     if (!role(ctx)) return ctx.reply("У вас нет доступа к статистике.");
@@ -214,8 +221,42 @@ function registerAdmin(bot, { rateLimiter = createRateLimiter() } = {}) {
     const kind = (value) => value === "deletion" ? "Удаление анкеты" : "Отзыв согласия";
     const status = (value) => value === "pending_review" ? "ожидает рассмотрения" : value === "processed" ? "обработан" : "не применимо";
     const items = visible.map((request, index) => `${currentPage * 10 + index + 1}. ${kind(request.request_type)} · ${status(request.status)} · ${new Date(request.requested_at).toLocaleDateString("ru-RU", { timeZone: "UTC" })}`).join("\n");
-    return ctx.reply(`📋 Запросы участников · страница ${currentPage + 1} из ${pageCount}\n\n${items}\n\nЗдесь показаны только тип, статус и дата. Решение о сроках хранения и исполнении запросов пока не настроено.`, { reply_markup: keyboard });
+    const demoRequests = String(process.env.DEMO_MODE).toLowerCase() === "true" ? db.listDemoTestDeletionRequests(10) : [];
+    const mainMessage = await ctx.reply(`📋 Запросы участников · страница ${currentPage + 1} из ${pageCount}\n\n${items}\n\nЗдесь показаны только тип, статус и дата. Решение о сроках хранения и исполнении обычных запросов пока не настроено.${demoRequests.length ? "\n\n🧪 Тестовые анкеты деморежима можно удалить отдельно после подтверждения владельцем или администратором." : ""}`, { reply_markup: keyboard });
+    if (!demoRequests.length) return mainMessage;
+    const inline = new InlineKeyboard();
+    for (const request of demoRequests) inline.text(`🧪 Рассмотреть тестовую анкету #${request.participant_id}`, `dtest:review:${request.participant_id}`).row();
+    await ctx.reply("Запросы на удаление тестовых анкет:", { reply_markup: inline });
+    return mainMessage;
   };
+  bot.callbackQuery(/^dtest:review:(\d{1,12})$/, async (ctx) => {
+    const id = String(ctx.from?.id ?? "");
+    if (!privateChat(ctx) || !role(ctx) || String(ctx.chat?.id) !== id || String(process.env.DEMO_MODE).toLowerCase() !== "true") return ctx.answerCallbackQuery({ text: "Действие недоступно." });
+    const participantId = Number(ctx.match[1]);
+    const request = db.listDemoTestDeletionRequests(100).find((item) => item.participant_id === participantId);
+    if (!request) return ctx.answerCallbackQuery({ text: "Запрос устарел или уже обработан." });
+    demoDeletionReviews.set(id, { participantId, requestId: request.request_id });
+    await ctx.answerCallbackQuery();
+    return ctx.reply(`Подтвердите фактическое удаление специально помеченной тестовой анкеты #${participantId}. Исходные 150 записей генератора удалить нельзя.`, { reply_markup: new InlineKeyboard().text("🗑 Удалить тестовую анкету", `dtest:confirm:${participantId}`).row().text("Отмена", `dtest:cancel:${participantId}`) });
+  });
+  bot.callbackQuery(/^dtest:(confirm|cancel):(\d{1,12})$/, async (ctx) => {
+    const actor = String(ctx.from?.id ?? "");
+    if (!privateChat(ctx) || !role(ctx) || String(ctx.chat?.id) !== actor || String(process.env.DEMO_MODE).toLowerCase() !== "true") return ctx.answerCallbackQuery({ text: "Действие недоступно." });
+    const pendingReview = demoDeletionReviews.get(actor);
+    const participantId = Number(ctx.match[2]);
+    if (!pendingReview || pendingReview.participantId !== participantId) return ctx.answerCallbackQuery({ text: "Подтверждение устарело." });
+    await ctx.answerCallbackQuery();
+    demoDeletionReviews.delete(actor);
+    try {
+      const finish = (text) => ctx.editMessageText(text, { reply_markup: { inline_keyboard: [] } });
+      if (ctx.match[1] === "cancel") return finish("Удаление отменено. Тестовая анкета сохранена.");
+      const request = db.listDemoTestDeletionRequests(100).find((item) => item.participant_id === participantId && item.request_id === pendingReview.requestId);
+      if (!request) return finish("Запрос уже обработан или устарел. Ничего не удалено.");
+      if (!role(ctx)) return finish("Административные права отозваны. Ничего не удалено.");
+      const result = db.deleteDemoTestParticipantById(participantId, actor, demoProjectRoot ? { projectRoot: demoProjectRoot } : undefined);
+      return finish(result.deleted ? "Тестовая анкета и связанные данные удалены из demo.sqlite." : "Анкета больше не найдена.");
+    } catch { return ctx.editMessageText("Не удалось безопасно удалить тестовую анкету. Проверьте права и состояние демобазы.", { reply_markup: { inline_keyboard: [] } }); }
+  });
   bot.hears("📋 Запросы участников", async (ctx) => renderParticipantDataRequestsPage(ctx, 0));
   bot.hears("📥 Скачать Excel", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Выгрузка доступна только в личном чате с ботом.");
@@ -386,6 +427,8 @@ function registerAdmin(bot, { rateLimiter = createRateLimiter() } = {}) {
     participantViews.stop();
     exportConfirmations.stop();
     exportPrompts.stop();
+    demoDeletionReviews.stop();
   };
 }
 module.exports = { registerAdmin, registerAdminUsernameRefresh };
+

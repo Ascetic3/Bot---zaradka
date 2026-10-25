@@ -8,12 +8,13 @@ const { makePhoneVerificationProof, makeConsentAttestation } = require("../src/r
 
 function setup() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-account-link-"));
-  const envKeys = ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PHONE_PROOF_SECRET", "DEMO_MODE"];
+  const envKeys = ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PRIVACY_POLICY_PUBLISHED", "PHONE_PROOF_SECRET", "DEMO_MODE"];
   const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const env = {
     DB_PATH: path.join(directory, "protocol.sqlite"),
     PRIVACY_POLICY_URL: "https://policy.invalid/link-test",
     PRIVACY_POLICY_VERSION: "fictional-link-v1",
+    PRIVACY_POLICY_PUBLISHED: "true",
     PHONE_PROOF_SECRET: "fictional-link-test-key-at-least-32",
     DEMO_MODE: "false"
   };
@@ -269,4 +270,5 @@ test("конкурентное завершение из двух соедине
     assert.equal(x.database.db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE platform='max'").get().n, 1);
   } finally { x.close(); }
 });
+
 

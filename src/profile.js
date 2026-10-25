@@ -26,7 +26,8 @@ function registerProfile(bot, { rateLimiter = createRateLimiter() } = {}) {
       return ctx.reply("Вы ещё не зарегистрированы в клубе „Магия утра“. ☀️\n\nДля создания анкеты нажмите „Зарегистрироваться“.");
     }
     const value = (field) => participant[field] || "Не указано";
-    const summary = `Ваша анкета:\n\nИмя: ${value("first_name")}\nФамилия: ${value("last_name")}\nТелефон: ${value("phone")}\nГород проживания: ${value("city")}\nEmail: ${value("email")}\nПредпочтительный способ связи: ${value("preferred_contact")}\nОткуда узнали о клубе: ${value("referral_source")}\nДата регистрации: ${formatDate(participant.registered_at)}`;
+    const demoTag = String(process.env.DEMO_MODE).toLowerCase() === "true" && db.isDemoTestParticipant(participant.id) ? "🧪 Тестовая анкета деморежима\n\n" : "";
+    const summary = `${demoTag}Ваша анкета:\n\nИмя: ${value("first_name")}\nФамилия: ${value("last_name")}\nТелефон: ${value("phone")}\nГород проживания: ${value("city")}\nEmail: ${value("email")}\nПредпочтительный способ связи: ${value("preferred_contact")}\nОткуда узнали о клубе: ${value("referral_source")}\nДата регистрации: ${formatDate(participant.registered_at)}`;
     return ctx.reply(summary, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🔐 Мои данные").row().text("🔗 Связанные аккаунты").row().text("🏠 Главное меню").resized() });
   });
   bot.hears("🏠 Главное меню", (ctx) => {
@@ -40,10 +41,12 @@ function registerProfile(bot, { rateLimiter = createRateLimiter() } = {}) {
   });
   bot.hears("✏️ Изменить данные", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("Анкету можно изменять только в личном чате с ботом.");
-    if (!db.findParticipantByTelegramId(ctx.from.id)) {
+    const ownParticipant = db.findParticipantByTelegramId(ctx.from.id);
+    if (!ownParticipant) {
       if (db.findParticipantByTelegramIdIncludingWithdrawn(ctx.from.id)) return ctx.reply("Редактирование анкеты временно ограничено. Обратитесь к организатору клуба.");
       return ctx.reply("Анкета не найдена.");
     }
+    if (String(process.env.DEMO_MODE).toLowerCase() === "true" && !db.isDemoTestParticipant(ownParticipant.id)) return ctx.reply("В деморежиме редактировать можно только специально созданную тестовую анкету.");
     if (!(await allowRequest(ctx, rateLimiter, "profile_edit"))) return;
     const keyboard = new Keyboard();
     for (const field of Object.keys(fields)) keyboard.text(field).row();
@@ -95,9 +98,11 @@ function registerProfile(bot, { rateLimiter = createRateLimiter() } = {}) {
     db.deleteDraft("telegram", ctx.from.id);
     const updated = db.findParticipantByTelegramId(ctx.from.id);
     const show = (v) => v || "Не указано";
-    const summary = `Ваша анкета:\n\nИмя: ${show(updated.first_name)}\nФамилия: ${show(updated.last_name)}\nТелефон: ${show(updated.phone)}\nГород проживания: ${show(updated.city)}\nEmail: ${show(updated.email)}\nПредпочтительный способ связи: ${show(updated.preferred_contact)}\nОткуда узнали о клубе: ${show(updated.referral_source)}\nДата регистрации: ${formatDate(updated.registered_at)}`;
+    const demoTag = String(process.env.DEMO_MODE).toLowerCase() === "true" && db.isDemoTestParticipant(updated.id) ? "🧪 Тестовая анкета деморежима\n\n" : "";
+    const summary = `${demoTag}Ваша анкета:\n\nИмя: ${show(updated.first_name)}\nФамилия: ${show(updated.last_name)}\nТелефон: ${show(updated.phone)}\nГород проживания: ${show(updated.city)}\nEmail: ${show(updated.email)}\nПредпочтительный способ связи: ${show(updated.preferred_contact)}\nОткуда узнали о клубе: ${show(updated.referral_source)}\nДата регистрации: ${formatDate(updated.registered_at)}`;
     return ctx.reply(`Данные успешно изменены.\n\n${summary}`, { reply_markup: new Keyboard().text("✏️ Изменить данные").row().text("🔐 Мои данные").row().text("🔗 Связанные аккаунты").row().text("🏠 Главное меню").resized() });
   });
 }
 
 module.exports = { registerProfile };
+

@@ -49,6 +49,7 @@ test("cancel bypasses a full answer limit and removes only the current user's re
   process.env.DB_PATH = path.join(directory, "test.sqlite");
   process.env.PRIVACY_POLICY_URL = "https://policy.invalid/test";
   process.env.PRIVACY_POLICY_VERSION = "test-v1";
+  process.env.PRIVACY_POLICY_PUBLISHED = "true";
   for (const name of ["../src/database", "../src/registration"]) delete require.cache[require.resolve(name)];
   const db = require("../src/database");
   const sent = [];
@@ -79,7 +80,7 @@ test("cancel bypasses a full answer limit and removes only the current user's re
     limiter.stop();
     db.closeDatabase();
     fs.rmSync(directory, { recursive: true, force: true });
-    for (const key of ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION"]) delete process.env[key];
+    for (const key of ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PRIVACY_POLICY_PUBLISHED"]) delete process.env[key];
     for (const name of ["../src/database", "../src/registration"]) delete require.cache[require.resolve(name)];
   }
 });
@@ -144,3 +145,4 @@ test("административный поиск ограничен отдел�
     for (const name of ["../src/database", "../src/admin"]) delete require.cache[require.resolve(name)];
   }
 });
+

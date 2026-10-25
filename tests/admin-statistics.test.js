@@ -116,3 +116,4 @@ test("статистика безопасно сокращает длинные 
     assert.equal(x.db.getParticipant(participant.id).referral_source,source);
   } finally {x.close();}
 });
+

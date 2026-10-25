@@ -1,5 +1,5 @@
 const CORE_TABLES = ["participants", "accounts", "admins", "registration_drafts"];
-const CURRENT_SCHEMA_VERSION = 7;
+const CURRENT_SCHEMA_VERSION = 9;
 
 const BASE_COLUMNS = {
   participants: ["id", "first_name", "last_name", "phone", "city", "email", "preferred_contact", "referral_source", "registered_at", "updated_at", "phone_confirmed_at", "personal_data_consent"],
@@ -141,11 +141,12 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
   if (unsupportedViews) throw new Error("Структура SQLite содержит неизвестные представления; автоматическое обновление остановлено.");
   if (version === 0 && names.length === 0) return { version, structuralVersion: 0, empty: true, legacyUnversioned: false, tables: [] };
   if (!CORE_TABLES.every((table) => names.includes(table))) throw new Error("Структура SQLite не распознана: отсутствуют обязательные таблицы.");
-  const allowedTables = new Set([...CORE_TABLES, "demo_seed_metadata", "consent_withdrawal_requests", "account_link_requests", "participant_deletion_requests"]);
+  const allowedTables = new Set([...CORE_TABLES, "demo_seed_metadata", "consent_withdrawal_requests", "account_link_requests", "participant_deletion_requests", "demo_test_participants"]);
   if (names.some((name) => !allowedTables.has(name))) throw new Error("Структура SQLite содержит неизвестные таблицы; автоматическое обновление остановлено.");
   const explicitIndexes = db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").all();
   const expectedIndexes = new Map([["idx_accounts_participant", "accounts"], ["idx_account_link_requests_participant", "account_link_requests"], ["uq_account_link_requests_target_active", "account_link_requests"], ["idx_participant_deletion_requests_status", "participant_deletion_requests"], ["uq_participant_deletion_requests_active", "participant_deletion_requests"]]);
-  const expectedIndexCount = 1 + (names.includes("account_link_requests") ? 2 : 0) + (names.includes("participant_deletion_requests") ? 2 : 0);
+  if (names.includes("demo_test_participants")) expectedIndexes.set("idx_demo_test_participants_created_at", "demo_test_participants");
+  const expectedIndexCount = 1 + (names.includes("account_link_requests") ? 2 : 0) + (names.includes("participant_deletion_requests") ? 2 : 0) + (names.includes("demo_test_participants") ? 1 : 0);
   if (explicitIndexes.some((index) => expectedIndexes.get(index.name) !== index.tbl_name) || explicitIndexes.length !== expectedIndexCount) throw new Error("Набор пользовательских индексов SQLite не совпадает с поддерживаемой схемой.");
   const accountParticipantIndex = indexes(db, "accounts").find((index) => index.name === "idx_accounts_participant");
   if (!accountParticipantIndex || accountParticipantIndex.unique || accountParticipantIndex.partial || JSON.stringify(accountParticipantIndex.columns) !== JSON.stringify(["participant_id"])) throw new Error("Индекс accounts.participant_id не совпадает с поддерживаемой схемой.");
@@ -179,6 +180,11 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
       }
     }
     structuralVersion = 1 + completed;
+    if (names.includes("participant_deletion_requests")) {
+      const hasHistoricalParticipantUnique = indexes(db, "participant_deletion_requests")
+        .some((index) => index.unique && !index.partial && JSON.stringify(index.columns) === JSON.stringify(["participant_id"]));
+      structuralVersion = hasHistoricalParticipantUnique ? 7 : 8;
+    }
     // Revalidate against the inferred exact version, including rejecting any
     // unrecognized columns and checking the constraints expected at that point.
     for (const table of CORE_TABLES) assertColumns(db, table, structuralVersion, false);
@@ -192,7 +198,7 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
   if (expectedAccountLinkSchema) assertAccountLinkRequestSchema(db);
   const expectedDeletionSchema = effectiveVersion >= 7;
   if (expectedDeletionSchema !== names.includes("participant_deletion_requests")) throw new Error("Таблица запросов удаления анкеты не соответствует версии схемы.");
-  if (expectedDeletionSchema) assertParticipantDeletionRequestSchema(db);
+  if (expectedDeletionSchema) assertParticipantDeletionRequestSchema(db, effectiveVersion);
   const triggerNames = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name NOT LIKE 'sqlite_%'").all().map(({ name }) => name);
   if (JSON.stringify(triggerNames.sort()) !== JSON.stringify((expectedAccountLinkSchema ? ["trg_account_link_requests_state_transition"] : []).sort())) throw new Error("Набор триггеров SQLite не совпадает с поддерживаемой схемой.");
   if (names.includes("demo_seed_metadata")) {
@@ -201,6 +207,8 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
     const expectedTypes = { seed_name: "TEXT", seed_version: "INTEGER", seeded_at: "TEXT", participant_count: "INTEGER" };
     if (expected.some((name) => !meta.has(name) || String(meta.get(name).type).toUpperCase() !== expectedTypes[name]) || meta.size !== expected.length || !meta.get("seed_name").pk || expected.slice(1).some((name) => !meta.get(name).notnull)) throw new Error("Таблица метаданных демобазы имеет неизвестную структуру.");
   }
+  if (names.includes("demo_test_participants")) assertDemoTestParticipantsSchema(db);
+  if ((effectiveVersion >= 9) !== names.includes("demo_test_participants")) throw new Error("Таблица меток тестовых демо-анкет не соответствует версии схемы.");
   const violations = db.prepare("PRAGMA foreign_key_check").all();
   if (violations.length) throw new Error("В SQLite найдены нарушенные связи между таблицами.");
   return { version, structuralVersion, empty: false, legacyUnversioned: version === 0, tables: names };
@@ -213,20 +221,39 @@ const migrationLabels = new Map([
   [4, "Добавление username администратора"],
   [5, "Технический учёт отзыва согласия"],
   [6, "Запросы безопасного связывания аккаунтов"],
-  [7, "Запросы участников на удаление анкеты"]
+  [7, "Запросы участников на удаление анкеты"],
+  [8, "Повторные запросы удаления после завершения предыдущего"],
+  [9, "Маркировка тестовых анкет деморежима"]
 ]);
 
-function assertParticipantDeletionRequestSchema(db) {
+function assertDemoTestParticipantsSchema(db) {
+  const table = "demo_test_participants";
+  const actual = columnMap(db, table);
+  const expected = { participant_id: "INTEGER", created_at: "TEXT" };
+  if (actual.size !== 2 || Object.entries(expected).some(([name, type]) => !actual.has(name) || String(actual.get(name).type).toUpperCase() !== type)) throw new Error("Структура demo_test_participants не соответствует поддерживаемой схеме.");
+  if (actual.get("participant_id").pk !== 1 || !actual.get("created_at").notnull || !String(actual.get("created_at").dflt_value || "").toLowerCase().includes("strftime")) throw new Error("Ограничения demo_test_participants не соответствуют схеме.");
+  const fk = db.prepare("PRAGMA foreign_key_list(demo_test_participants)").all();
+  if (fk.length !== 1 || !fk.some((item) => item.table === "participants" && item.from === "participant_id" && item.to === "id" && item.on_delete.toUpperCase() === "CASCADE")) throw new Error("Метка тестовой анкеты должна удаляться каскадно вместе с участником.");
+  const index = indexes(db, table).find((item) => item.name === "idx_demo_test_participants_created_at");
+  const indexSql = normalizeSql(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_demo_test_participants_created_at'").get()?.sql);
+  if (!index || index.unique || index.partial || JSON.stringify(index.columns) !== JSON.stringify(["created_at"]) || indexSql !== "createindexidx_demo_test_participants_created_atondemo_test_participants(created_at)") throw new Error("Индекс demo_test_participants.created_at не соответствует схеме.");
+  const tableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table)?.sql;
+  if (checkExpressions(tableSql).length) throw new Error("В схеме меток тестовых анкет найдены неподдерживаемые ограничения.");
+}
+
+function assertParticipantDeletionRequestSchema(db, version = CURRENT_SCHEMA_VERSION) {
   const table = "participant_deletion_requests";
   const actual = columnMap(db, table);
   const expected = { id: "INTEGER", request_id: "TEXT", participant_id: "INTEGER", requested_at: "TEXT", status: "TEXT" };
   if (actual.size !== Object.keys(expected).length || Object.entries(expected).some(([name, type]) => !actual.has(name) || String(actual.get(name).type).toUpperCase() !== type)) throw new Error("Структура participant_deletion_requests не соответствует поддерживаемой схеме.");
-  if (!actual.get("id").pk || !actual.get("request_id").notnull || actual.get("participant_id").notnull || !actual.get("requested_at").notnull || !actual.get("status").notnull || !hasUnique(db, table, ["request_id"]) || !hasUnique(db, table, ["participant_id"])) throw new Error("Ограничения запросов удаления анкеты не соответствуют схеме.");
+  const tableIndexes = indexes(db, table);
+  const requestIdUnique = tableIndexes.some((index) => index.unique && !index.partial && JSON.stringify(index.columns) === JSON.stringify(["request_id"]));
+  const participantIdUnique = tableIndexes.some((index) => index.unique && !index.partial && JSON.stringify(index.columns) === JSON.stringify(["participant_id"]));
+  if (!actual.get("id").pk || !actual.get("request_id").notnull || actual.get("participant_id").notnull || !actual.get("requested_at").notnull || !actual.get("status").notnull || actual.get("status").dflt_value !== "'pending_review'" || !requestIdUnique || participantIdUnique !== (version === 7)) throw new Error("Ограничения запросов удаления анкеты не соответствуют схеме.");
   const fks = db.prepare(`PRAGMA foreign_key_list(${table})`).all();
   if (!fks.some((fk) => fk.table === "participants" && fk.from === "participant_id" && fk.to === "id" && fk.on_delete.toUpperCase() === "SET NULL")) throw new Error("Запрос удаления должен обезличиваться при удалении участника.");
   const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table)?.sql;
   if (JSON.stringify(checkExpressions(sql)) !== JSON.stringify(["statusin('pending_review','processed','not_applicable')"])) throw new Error("Допустимые состояния запроса удаления анкеты не совпадают со схемой.");
-  const tableIndexes = indexes(db, table);
   const statusIndex = tableIndexes.find((item) => item.name === "idx_participant_deletion_requests_status");
   const indexSql = normalizeSql(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_participant_deletion_requests_status'").get()?.sql);
   const activeIndex = tableIndexes.find((item) => item.name === "uq_participant_deletion_requests_active");
@@ -273,22 +300,25 @@ function assertWithdrawalSchema(db) {
   if (JSON.stringify(checkExpressions(sql)) !== JSON.stringify(["statusin('pending_review','processed','not_applicable')"])) throw new Error("Допустимые состояния запроса отзыва согласия не совпадают со схемой.");
 }
 
-function migrateDatabase(db, { beforeVersionCommit } = {}) {
+function migrateDatabase(db, { beforeVersionCommit, targetVersion = CURRENT_SCHEMA_VERSION } = {}) {
+  if (!Number.isInteger(targetVersion) || targetVersion < 1 || targetVersion > CURRENT_SCHEMA_VERSION) throw new Error("Недопустимая целевая версия миграции.");
   const initial = inspectSchema(db);
-  if (initial.version === CURRENT_SCHEMA_VERSION) return { from: initial.version, to: CURRENT_SCHEMA_VERSION, applied: [] };
+  if (initial.version > targetVersion) throw new Error("Нельзя выполнить миграцию в обратную сторону.");
+  if (initial.version === targetVersion) return { from: initial.version, to: targetVersion, applied: [] };
   const from = initial.version;
   const startingVersion = initial.legacyUnversioned ? initial.structuralVersion : from;
-  if (initial.legacyUnversioned && startingVersion === CURRENT_SCHEMA_VERSION) {
+  if (startingVersion > targetVersion) throw new Error("Нельзя выполнить миграцию в обратную сторону.");
+  if (initial.legacyUnversioned && startingVersion === targetVersion) {
     const stamp = db.transaction(() => {
-      beforeVersionCommit?.(CURRENT_SCHEMA_VERSION, db);
-      db.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
+      beforeVersionCommit?.(targetVersion, db);
+      db.pragma(`user_version = ${targetVersion}`);
     });
     stamp.immediate();
     inspectSchema(db, { allowKnownOptionalColumns: false });
-    return { from, detectedVersion: startingVersion, to: CURRENT_SCHEMA_VERSION, applied: [], stampedVersion: true };
+    return { from, detectedVersion: startingVersion, to: targetVersion, applied: [], stampedVersion: true };
   }
   const applied = [];
-  for (let target = initial.empty ? 1 : startingVersion + 1; target <= CURRENT_SCHEMA_VERSION; target += 1) {
+  for (let target = initial.empty ? 1 : startingVersion + 1; target <= targetVersion; target += 1) {
     const run = db.transaction(() => {
       if (target === 1 && initial.empty) createBaseSchema(db);
       if (target === 2 && !columnMap(db, "participants").has("consent_at")) db.exec("ALTER TABLE participants ADD COLUMN consent_at TEXT");
@@ -339,6 +369,28 @@ function migrateDatabase(db, { beforeVersionCommit } = {}) {
       );
       CREATE INDEX idx_participant_deletion_requests_status ON participant_deletion_requests(status,requested_at);
       CREATE UNIQUE INDEX uq_participant_deletion_requests_active ON participant_deletion_requests(participant_id) WHERE status='pending_review';`);
+      if (target === 8) db.exec(`
+        CREATE TABLE participant_deletion_requests_v8 (
+          id INTEGER PRIMARY KEY,
+          request_id TEXT NOT NULL UNIQUE,
+          participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
+          requested_at TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending_review' CHECK(status IN ('pending_review','processed','not_applicable'))
+        );
+        INSERT INTO participant_deletion_requests_v8(id,request_id,participant_id,requested_at,status)
+          SELECT id,request_id,participant_id,requested_at,status FROM participant_deletion_requests;
+        DROP TABLE participant_deletion_requests;
+        ALTER TABLE participant_deletion_requests_v8 RENAME TO participant_deletion_requests;
+        CREATE INDEX idx_participant_deletion_requests_status ON participant_deletion_requests(status,requested_at);
+        CREATE UNIQUE INDEX uq_participant_deletion_requests_active ON participant_deletion_requests(participant_id) WHERE status='pending_review';
+      `);
+      if (target === 9) db.exec(`
+        CREATE TABLE demo_test_participants (
+          participant_id INTEGER PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX idx_demo_test_participants_created_at ON demo_test_participants(created_at);
+      `);
       beforeVersionCommit?.(target, db);
       db.pragma(`user_version = ${target}`);
     });
@@ -346,7 +398,7 @@ function migrateDatabase(db, { beforeVersionCommit } = {}) {
     inspectSchema(db);
     applied.push({ version: target, label: migrationLabels.get(target) });
   }
-  return { from, detectedVersion: startingVersion, to: CURRENT_SCHEMA_VERSION, applied, stampedVersion: initial.legacyUnversioned };
+  return { from, detectedVersion: startingVersion, to: targetVersion, applied, stampedVersion: initial.legacyUnversioned };
 }
 
 function previewMigrations(db) {
@@ -373,3 +425,4 @@ function initializeEmptyDatabase(db) {
 }
 
 module.exports = { CURRENT_SCHEMA_VERSION, CORE_TABLES, inspectSchema, migrateDatabase, previewMigrations, initializeEmptyDatabase, createBaseSchema };
+

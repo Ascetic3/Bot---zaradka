@@ -1,9 +1,11 @@
-const { Keyboard } = require("grammy");
+const crypto = require("node:crypto");
+const { Keyboard, InlineKeyboard } = require("grammy");
 const db = require("./database");
 const { isPrivateChat } = require("./chat-guards");
 const { getRegistrationPolicy, validateFieldValue, createRegisteredParticipant, registrationService } = require("./participant-service");
 const { createOwnContactProof, createConsentReceipt } = require("./registration-adapters/telegram");
 const { createRateLimiter, allowRequest } = require("./request-limits");
+const { mainMenuKeyboard, mainMenuText } = require("./main-menu");
 const prompts = {
   first_name: "Как вас зовут? ☀️", last_name: "Введите вашу фамилию.",
   phone: "Поделитесь номером телефона, чтобы мы могли связаться с вами по вопросам клуба.",
@@ -33,23 +35,132 @@ const menu = (step) => {
   return k.text("❌ Отменить регистрацию").resized();
 };
 const choicesKeyboard = (step) => { const k = new Keyboard(); for (const v of values[step]) k.text(v).row(); if (order.indexOf(step)>0) k.text("⬅️ Назад").row(); return k.text("❌ Отменить регистрацию").resized(); };
+function escapeHtml(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function createConsentDraftAnswers(previousAnswers, policy, resumeStep = null) {
+  const answers = { ...previousAnswers, policy_url: policy.url, policy_version: policy.version, consent_nonce: crypto.randomBytes(16).toString("hex") };
+  for (const key of ["consent_attestation", "consent_at", "consent_version", "consent_given_by", "personal_data_consent"]) delete answers[key];
+  if (order.includes(resumeStep) || resumeStep === "confirm") answers.resume_after_consent = resumeStep;
+  else delete answers.resume_after_consent;
+  return answers;
+}
 function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
   const replyStep = (ctx, step) => ctx.reply(prompts[step] || "Введите свой вариант:", { reply_markup: step === "preferred_contact" || step === "referral_source" ? choicesKeyboard(step) : menu(step) });
   const showSummary = (ctx, answers) => ctx.reply(`Проверьте ваши данные:\n\nИмя: ${answers.first_name}\nФамилия: ${answers.last_name}\nТелефон: ${answers.phone}\nГород: ${answers.city || "не указан"}\nEmail: ${answers.email || "не указан"}\nПредпочтительный способ связи: ${answers.preferred_contact}\nОткуда узнали о клубе: ${answers.referral_source || "не указано"}\n\nВсё верно?`, { reply_markup: new Keyboard().text("✅ Подтвердить регистрацию").row().text("✏️ Исправить данные").row().text("❌ Отмена").resized() });
+  const renderConsent = (ctx, answers) => {
+    const text = "<b>Согласие на обработку персональных данных</b>\n\n" +
+      "Для регистрации в клубе „Магия утра“ нам потребуются ваши имя, фамилия, номер телефона и дополнительные сведения, которые вы решите указать.\n\n" +
+      "Также Telegram ID используется, чтобы связать анкету с вашим аккаунтом и показывать её только вам.\n\n" +
+      "Пожалуйста, ознакомьтесь с <a href=\"" + escapeHtml(answers.policy_url) + "\">Политикой обработки персональных данных</a>.\n\n" +
+      "Нажимая «Принимаю», вы даёте согласие на обработку указанных данных для регистрации и связи по вопросам деятельности клуба.\n\n" +
+      "Вы можете отозвать согласие в разделе «🔐 Мои данные».";
+    const keyboard = new InlineKeyboard()
+      .text("✅ Принимаю", "mconsent:a:" + answers.consent_nonce)
+      .row()
+      .text("❌ Отказываюсь", "mconsent:d:" + answers.consent_nonce);
+    return ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
+  };
+  const refreshConsent = (ctx, uid, answers, policy, resumeStep) => {
+    const freshAnswers = createConsentDraftAnswers(answers, policy, resumeStep);
+    db.saveDraft("telegram", uid, "consent", freshAnswers);
+    return renderConsent(ctx, freshAnswers);
+  };
+  const removeConsentButtons = async (ctx) => {
+    if (!ctx.callbackQuery?.message) return;
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch { /* stale Telegram message: its callback remains harmless */ }
+  };
+  const refuseConsent = async (ctx, uid) => {
+    db.deleteDraft("telegram", uid);
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "Отказ принят. Черновик регистрации удалён." });
+      await removeConsentButtons(ctx);
+    }
+    return ctx.reply("Вы отказались от обработки данных для регистрации. Черновик удалён.\n\n" + mainMenuText, { reply_markup: mainMenuKeyboard });
+  };
+  const acceptConsent = async (ctx, uid, draft) => {
+    if (!(await allowRequest(ctx, rateLimiter, "registration_continue"))) {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Слишком много запросов. Попробуйте позже." });
+      return;
+    }
+    if (String(process.env.DEMO_MODE).toLowerCase() === "true") {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Реальная регистрация отключена в деморежиме." });
+      return ctx.reply("Настоящая регистрация отключена в демонстрационном режиме. Черновик сохранён.");
+    }
+    const activePolicy = getRegistrationPolicy();
+    if (!activePolicy) {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Политика не опубликована или не настроена." });
+      return ctx.reply("Регистрация временно недоступна: администратору нужно заполнить, утвердить и опубликовать политику, затем настроить PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION и PRIVACY_POLICY_PUBLISHED=true.");
+    }
+    if (draft.answers.policy_url !== activePolicy.url || draft.answers.policy_version !== activePolicy.version) {
+      const resumeStep = draft.answers.resume_after_consent || (draft.current_step === "consent" ? null : draft.current_step);
+      if (ctx.callbackQuery) {
+        await ctx.answerCallbackQuery({ text: "Версия политики изменилась. Проверьте актуальный текст." });
+        await removeConsentButtons(ctx);
+      }
+      return refreshConsent(ctx, uid, draft.answers, activePolicy, resumeStep);
+    }
+    const answers = { ...draft.answers };
+    try {
+      answers.consent_attestation = createConsentReceipt({ telegramUserId: uid, policyUrl: activePolicy.url, policyVersion: activePolicy.version });
+    } catch {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Не удалось зафиксировать согласие." });
+      return ctx.reply("Не удалось безопасно зафиксировать согласие. Попробуйте позже или обратитесь к организатору клуба.");
+    }
+    answers.consent_at = answers.consent_attestation.accepted_at;
+    answers.consent_version = activePolicy.version;
+    answers.consent_given_by = String(uid);
+    answers.personal_data_consent = true;
+    const resumeStep = answers.resume_after_consent;
+    delete answers.resume_after_consent;
+    delete answers.consent_nonce;
+    const nextStep = order.includes(resumeStep) ? resumeStep : "first_name";
+    db.saveDraft("telegram", uid, nextStep, answers);
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "Согласие зафиксировано." });
+      await removeConsentButtons(ctx);
+    }
+    return nextStep === "confirm" ? showSummary(ctx, answers) : replyStep(ctx, nextStep);
+  };
+  bot.callbackQuery(/^mconsent:([ad]):([a-f0-9]{32})$/, async (ctx) => {
+    const uid = ctx.from?.id;
+    if (!uid || !isPrivateChat(ctx) || String(ctx.chat?.id) !== String(uid)) {
+      return ctx.answerCallbackQuery({ text: "Согласие доступно только в личном чате с ботом." });
+    }
+    const [, action, nonce] = ctx.match;
+    const draft = db.getDraft("telegram", uid);
+    if (!draft || draft.current_step !== "consent" || draft.answers.consent_nonce !== nonce) {
+      return ctx.answerCallbackQuery({ text: "Кнопка устарела или уже обработана." });
+    }
+    if (action === "d") return refuseConsent(ctx, uid);
+    return acceptConsent(ctx, uid, draft);
+  });
   bot.hears("Зарегистрироваться", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("🔒 Регистрация доступна только в личном чате.\n\nОткройте @magia_utra_club_bot, чтобы зарегистрироваться.");
     if (!(await allowRequest(ctx, rateLimiter, "registration_start"))) return;
     if (String(process.env.DEMO_MODE).toLowerCase() === "true") return ctx.reply("Настоящая регистрация отключена в демонстрационном режиме. Используйте /preview_registration для просмотра анкеты.");
     if (db.findParticipantByTelegramIdIncludingWithdrawn(ctx.from.id)) return ctx.reply("Вы уже зарегистрированы в клубе.");
     const policy = getRegistrationPolicy();
-    if (!policy) return ctx.reply("Регистрация временно недоступна: администратору нужно настроить PRIVACY_POLICY_URL и PRIVACY_POLICY_VERSION.");
+    if (!policy) return ctx.reply("Регистрация временно недоступна: администратору нужно заполнить, утвердить и опубликовать политику, затем настроить PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION и PRIVACY_POLICY_PUBLISHED=true.");
     const draft = db.getDraft("telegram", ctx.from.id);
-    if (draft) {
-      if (draft.answers.policy_url !== policy.url || draft.answers.policy_version !== policy.version) return ctx.reply("Версия политики изменилась. Начните регистрацию заново, чтобы дать согласие на актуальные условия.");
-      return draft.current_step === "confirm" ? showSummary(ctx, draft.answers) : replyStep(ctx, draft.current_step);
+    if (!draft) {
+      const answers = createConsentDraftAnswers({}, policy);
+      db.saveDraft("telegram", ctx.from.id, "consent", answers);
+      return renderConsent(ctx, answers);
     }
-    db.saveDraft("telegram", ctx.from.id, "consent", { policy_url: policy.url, policy_version: policy.version });
-    return ctx.reply(`Перед регистрацией ознакомьтесь с политикой: ${policy.url}\n\nНажмите «Согласен», чтобы продолжить, или «❌ Отменить регистрацию».`, { reply_markup: new Keyboard().text("Согласен").row().text("❌ Отменить регистрацию").resized() });
+    if (draft.answers.policy_url !== policy.url || draft.answers.policy_version !== policy.version) {
+      const resumeStep = draft.answers.resume_after_consent || (draft.current_step === "consent" ? null : draft.current_step);
+      return refreshConsent(ctx, ctx.from.id, draft.answers, policy, resumeStep);
+    }
+    if (draft.current_step === "consent") {
+      if (!/^[a-f0-9]{32}$/.test(String(draft.answers.consent_nonce ?? ""))) {
+        const answers = createConsentDraftAnswers(draft.answers, policy, draft.answers.resume_after_consent);
+        db.saveDraft("telegram", ctx.from.id, "consent", answers);
+        return renderConsent(ctx, answers);
+      }
+      return renderConsent(ctx, draft.answers);
+    }
+    return draft.current_step === "confirm" ? showSummary(ctx, draft.answers) : replyStep(ctx, draft.current_step);
   });
   bot.on("message", async (ctx, next) => {
     if (!ctx.from || (!ctx.message.text && !ctx.message.contact)) return next();
@@ -81,21 +192,7 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
     const activePolicy = getRegistrationPolicy();
     if (!activePolicy) return ctx.reply("Продолжение регистрации временно недоступно: администратору нужно настроить PRIVACY_POLICY_URL и PRIVACY_POLICY_VERSION. Черновик сохранён.");
     if (a.policy_url !== activePolicy.url || a.policy_version !== activePolicy.version) return ctx.reply("Версия политики изменилась. Анкета не сохранена. Начните регистрацию заново после согласия с актуальными условиями.");
-    if (step === "consent") {
-      if (input !== "Согласен") return ctx.reply("Нужно согласиться с обработкой данных или отменить регистрацию.");
-      try {
-        a.consent_attestation = createConsentReceipt({ telegramUserId: uid, policyUrl: activePolicy.url, policyVersion: activePolicy.version });
-      } catch {
-        return ctx.reply("Не удалось безопасно зафиксировать согласие. Попробуйте позже или обратитесь к организатору клуба.");
-      }
-      a.consent_at = a.consent_attestation.accepted_at; a.consent_version = activePolicy.version; a.consent_given_by = String(uid); a.personal_data_consent = true;
-      if (a.resume_after_consent === "confirm") {
-        delete a.resume_after_consent;
-        db.saveDraft("telegram", uid, "confirm", a);
-        return showSummary(ctx, a);
-      }
-      db.saveDraft("telegram", uid, "first_name", a); return replyStep(ctx, "first_name");
-    }
+    if (step === "consent") return ctx.reply("Пожалуйста, используйте inline-кнопки «✅ Принимаю» или «❌ Отказываюсь» под сообщением о согласии.");
     if (step === "confirm") {
       if (input === "⬅️ Назад") return showSummary(ctx, a);
       if (input === "✅ Подтвердить регистрацию") {
@@ -115,9 +212,9 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
             return ctx.reply("Подтверждение телефона отсутствует или устарело. Поделитесь собственным контактом ещё раз.", { reply_markup: menu("phone") });
           }
           if (e.code === "CONSENT_ATTESTATION_INVALID") {
-            delete a.consent_attestation; a.personal_data_consent = false; a.consent_at = null; a.consent_version = null; a.consent_given_by = null; a.resume_after_consent = "confirm";
-            db.saveDraft("telegram", uid, "consent", a);
-            return ctx.reply(`Пожалуйста, подтвердите согласие с действующей политикой: ${activePolicy.url}\n\nНажмите «Согласен», чтобы вернуться к проверке анкеты, или «❌ Отменить регистрацию».`, { reply_markup: new Keyboard().text("Согласен").row().text("❌ Отменить регистрацию").resized() });
+            const answers = createConsentDraftAnswers(a, activePolicy, "confirm");
+            db.saveDraft("telegram", uid, "consent", answers);
+            return renderConsent(ctx, answers);
           }
           throw e;
         }
@@ -194,4 +291,5 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
   });
 }
 module.exports = { registerRegistration, registrationFlow: { prompts, order, optional, values, fieldNames } };
+
 

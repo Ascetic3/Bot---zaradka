@@ -27,3 +27,4 @@ function createConsentReceipt({ telegramUserId, policyUrl, policyVersion, accept
 }
 
 module.exports = { createOwnContactProof, createConsentReceipt };
+

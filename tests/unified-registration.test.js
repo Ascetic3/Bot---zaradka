@@ -13,11 +13,12 @@ const serviceModulePath = path.resolve(__dirname, "../src/participant-service.js
 
 function setup({ allowedPhoneMethods = { telegram: ["telegram_contact"] } } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-unified-registration-"));
-  const savedEnv = Object.fromEntries(["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PHONE_PROOF_SECRET", "DEMO_MODE"].map(key => [key, process.env[key]]));
+  const savedEnv = Object.fromEntries(["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PRIVACY_POLICY_PUBLISHED", "PHONE_PROOF_SECRET", "DEMO_MODE"].map(key => [key, process.env[key]]));
   const env = {
     DB_PATH: path.join(directory, "registration.sqlite"),
     PRIVACY_POLICY_URL: "https://policy.invalid/synthetic",
     PRIVACY_POLICY_VERSION: "synthetic-v1",
+    PRIVACY_POLICY_PUBLISHED: "true",
     PHONE_PROOF_SECRET: "synthetic-unified-registration-key-v1",
     DEMO_MODE: "false"
   };
@@ -243,6 +244,7 @@ test("два процесса регистрации через независи
       process.env.DB_PATH = workerData.dbPath;
       process.env.PRIVACY_POLICY_URL = workerData.env.PRIVACY_POLICY_URL;
       process.env.PRIVACY_POLICY_VERSION = workerData.env.PRIVACY_POLICY_VERSION;
+      process.env.PRIVACY_POLICY_PUBLISHED = workerData.env.PRIVACY_POLICY_PUBLISHED;
       process.env.PHONE_PROOF_SECRET = workerData.env.PHONE_PROOF_SECRET;
       const service = require(workerData.serviceModulePath);
       parentPort.postMessage({ ready: true });
@@ -286,3 +288,4 @@ test("два процесса регистрации через независи
     assert.equal(child.status, 0, child.stderr || child.stdout);
   } finally { x.close(); }
 });
+

@@ -39,12 +39,15 @@ function getExportFilename(now = new Date()) {
 }
 
 async function createParticipantsWorkbook(participants) {
+  const exportColumns = participants.some((person) => person.demo_test)
+    ? [...columns, { header: "Метка деморежима", key: "demo_label", width: 24, text: true }]
+    : columns;
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Клуб «Магия утра»";
   workbook.created = new Date();
   const worksheet = workbook.addWorksheet("Участники", { views: [{ state: "frozen", ySplit: 1 }] });
-  worksheet.columns = columns.map(({ header, key, width }) => ({ header, key, width }));
-  worksheet.autoFilter = { from: "A1", to: `${worksheet.getColumn(columns.length).letter}1` };
+  worksheet.columns = exportColumns.map(({ header, key, width }) => ({ header, key, width }));
+  worksheet.autoFilter = { from: "A1", to: `${worksheet.getColumn(exportColumns.length).letter}1` };
   const header = worksheet.getRow(1);
   header.height = 30;
   header.eachCell((cell) => {
@@ -67,9 +70,10 @@ async function createParticipantsWorkbook(participants) {
       telegram_id: asText(person.telegram_id),
       max_id: asText(person.max_id),
       phone_status: person.phone_confirmed_at ? "Подтверждён" : "Не подтверждён",
-      consent_at: asDate(person.consent_at)
+      consent_at: asDate(person.consent_at),
+      demo_label: person.demo_test ? "Тестовая анкета" : "Синтетическая запись"
     });
-    for (const column of columns) {
+    for (const column of exportColumns) {
       const cell = row.getCell(column.key);
       if (column.date && cell.value instanceof Date) {
         cell.numFmt = "dd.mm.yyyy hh:mm";

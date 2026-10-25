@@ -112,3 +112,4 @@ test("явная миграция старой полной схемы доба�
     assert.deepEqual(row, { telegram_id: "10001", role: "owner", username: null });
   } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+

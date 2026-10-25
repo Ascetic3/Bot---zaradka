@@ -61,3 +61,4 @@ pollingPromise.catch((error) => {
   handleStartupError(error);
   void shutdown.shutdown("startup_error");
 });
+

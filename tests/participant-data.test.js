@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { Worker } = require("node:worker_threads");
 const Database = require("better-sqlite3");
 const { createBackupManager, verifyBackupFile } = require("../src/database/backup");
 
@@ -130,11 +131,107 @@ test("сбой удаления участника откатывает удал
   try {
     const participant = x.createParticipant("700000021", 21);
     x.db.saveDraft("telegram", "700000021", "city", { synthetic: true });
+    x.db.createParticipantDeletionRequestForTelegram("700000021", "00000000-0000-4000-8000-000000000021", FIXED_NOW.toISOString());
     x.db.db.exec("CREATE TRIGGER reject_test_participant_delete BEFORE DELETE ON participants BEGIN SELECT RAISE(ABORT, 'synthetic delete failure'); END");
     assert.throws(() => x.db.deleteParticipantById(participant.id), /synthetic delete failure/);
     assert.equal(x.db.getParticipant(participant.id).id, participant.id);
     assert.equal(x.db.findParticipantByTelegramId("700000021").id, participant.id);
     assert.equal(x.db.hasDraft("telegram", "700000021"), true);
+    assert.equal(x.db.db.prepare("SELECT status FROM participant_deletion_requests WHERE participant_id=?").get(participant.id).status, "pending_review");
+  } finally { x.close(); }
+});
+
+test("повторный запрос удаления разрешён после processed и not_applicable, но не при активном запросе", () => {
+  const x = setup();
+  try {
+    const participant = x.createParticipant("700000025", 25);
+    const first = x.db.createParticipantDeletionRequestForTelegram("700000025", "00000000-0000-4000-8000-000000000025", FIXED_NOW.toISOString());
+    assert.equal(first.status, "received");
+    assert.equal(x.db.createParticipantDeletionRequestForTelegram("700000025", "00000000-0000-4000-8000-000000000026", "2026-10-20T10:01:00.000Z").status, "already_requested");
+    x.db.db.prepare("UPDATE participant_deletion_requests SET status='processed' WHERE request_id=?").run(first.request_id);
+    const second = x.db.createParticipantDeletionRequestForTelegram("700000025", "00000000-0000-4000-8000-000000000027", "2026-10-20T10:02:00.000Z");
+    assert.equal(second.status, "received");
+    x.db.db.prepare("UPDATE participant_deletion_requests SET status='not_applicable' WHERE request_id=?").run(second.request_id);
+    const third = x.db.createParticipantDeletionRequestForTelegram("700000025", "00000000-0000-4000-8000-000000000028", "2026-10-20T10:03:00.000Z");
+    assert.equal(third.status, "received");
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM participant_deletion_requests WHERE participant_id=?").get(participant.id).count, 3);
+  } finally { x.close(); }
+});
+
+test("два независимых SQLite-подключения не создают одновременно два активных запроса", async () => {
+  const x = setup();
+  const workers = [];
+  try {
+    x.createParticipant("700000029", 29);
+    const start = new SharedArrayBuffer(4);
+    const workerCode = `
+      const { parentPort, workerData } = require("node:worker_threads");
+      process.env.DB_PATH = workerData.dbPath;
+      const database = require(workerData.modulePath);
+      parentPort.postMessage({ ready: true });
+      Atomics.wait(new Int32Array(workerData.start), 0, 0);
+      try {
+        const result = database.createParticipantDeletionRequestForTelegram(workerData.telegramId, workerData.requestId, "2026-10-20T10:10:00.000Z");
+        parentPort.postMessage({ status: result.status });
+      } catch (error) { parentPort.postMessage({ error: error.code || error.message }); }
+      finally { database.closeDatabase(); }
+    `;
+    const results = [];
+    const ready = [];
+    for (let i = 0; i < 2; i += 1) {
+      const worker = new Worker(workerCode, { eval: true, workerData: {
+        dbPath: x.db.dbPath,
+        modulePath: require.resolve("../src/database"),
+        telegramId: "700000029",
+        requestId: `00000000-0000-4000-8000-${String(i + 29).padStart(12, "0")}`,
+        start
+      } });
+      workers.push(worker);
+      ready.push(new Promise((resolve, reject) => {
+        worker.once("message", (message) => message.ready ? resolve() : reject(new Error("SQLite worker did not become ready")));
+        worker.once("error", reject);
+      }));
+      results.push(new Promise((resolve, reject) => {
+        worker.on("message", (message) => { if (message.status || message.error) resolve(message); });
+        worker.once("error", reject);
+      }));
+    }
+    await Promise.all(ready);
+    Atomics.store(new Int32Array(start), 0, 1);
+    Atomics.notify(new Int32Array(start), 0, 2);
+    const outcomes = await Promise.all(results);
+    assert.deepEqual(outcomes.map((value) => value.status).sort(), ["already_requested", "received"]);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM participant_deletion_requests WHERE status='pending_review'").get().count, 1);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM participant_deletion_requests").get().count, 1);
+  } finally {
+    await Promise.all(workers.map((worker) => worker.terminate().catch(() => {})));
+    x.close();
+  }
+});
+
+test("успешное удаление анкеты завершает запрос и оставляет только обезличенную историю", () => {
+  const x = setup();
+  try {
+    const participant = x.createParticipant("700000030", 30);
+    x.db.linkAccount(participant.id, "max", "DEMO-ACCOUNT-030");
+    x.db.saveDraft("telegram", "700000030", "city", { synthetic: true });
+    const created = x.db.createParticipantDeletionRequestForTelegram("700000030", "00000000-0000-4000-8000-000000000030", FIXED_NOW.toISOString());
+    assert.equal(created.status, "received");
+
+    const result = x.db.deleteParticipantById(participant.id);
+    assert.equal(result.deleted, true);
+    assert.equal(result.deletion_requests_processed, 1);
+    assert.equal(x.db.getParticipant(participant.id), undefined);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM accounts WHERE participant_id=?").get(participant.id).count, 0);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM registration_drafts WHERE messenger_user_id='700000030'").get().count, 0);
+    const request = x.db.db.prepare("SELECT request_id,participant_id,requested_at,status FROM participant_deletion_requests WHERE request_id=?").get(created.request_id);
+    assert.deepEqual(request, { request_id: created.request_id, participant_id: null, requested_at: FIXED_NOW.toISOString(), status: "processed" });
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM participant_deletion_requests WHERE status='pending_review'").get().count, 0);
+
+    const repeated = x.db.deleteParticipantById(participant.id);
+    assert.equal(repeated.deleted, false);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM participant_deletion_requests WHERE status='pending_review'").get().count, 0);
+    assert.equal(x.db.db.prepare("PRAGMA foreign_key_check").all().length, 0);
   } finally { x.close(); }
 });
 
@@ -227,3 +324,4 @@ test("телефон нельзя поменять текстом, чужим к
     assert.equal(updated.phone_confirmed_at, "2026-10-20T09:00:00.000Z");
   } finally { x.close(); }
 });
+

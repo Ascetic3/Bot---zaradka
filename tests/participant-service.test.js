@@ -12,6 +12,7 @@ function setup() {
   process.env.DB_PATH = path.join(dir, "temporary.sqlite");
   process.env.PRIVACY_POLICY_URL = "https://policy.invalid/test";
   process.env.PRIVACY_POLICY_VERSION = "approved-test-version";
+  process.env.PRIVACY_POLICY_PUBLISHED = "true";
   process.env.PHONE_PROOF_SECRET = "synthetic-participant-service-secret-v1";
   delete process.env.DEMO_MODE;
   delete require.cache[require.resolve("../src/database")];
@@ -34,7 +35,7 @@ function setup() {
     dir, db, service, answers,
     close() {
       db.closeDatabase(); fs.rmSync(dir, { recursive: true, force: true });
-      for (const key of ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PHONE_PROOF_SECRET", "DEMO_MODE"]) delete process.env[key];
+      for (const key of ["DB_PATH", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PRIVACY_POLICY_PUBLISHED", "PHONE_PROOF_SECRET", "DEMO_MODE"]) delete process.env[key];
       delete require.cache[require.resolve("../src/database")];
       delete require.cache[require.resolve("../src/participant-service")];
     }
@@ -117,3 +118,4 @@ test("явная миграция распознанной старой схем
     assert.equal(legacy.prepare("SELECT first_name FROM participants WHERE id=1").get().first_name, "СтарыйТест");
   } finally { legacy.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+

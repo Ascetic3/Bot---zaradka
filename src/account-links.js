@@ -179,3 +179,4 @@ function registerAccountLinks(bot, { rateLimiter = createRateLimiter() } = {}) {
 }
 
 module.exports = { registerAccountLinks };
+

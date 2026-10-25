@@ -258,3 +258,4 @@ test("настройка запуска выбирает только demo.sqlit
     assert.throws(() => configureDemoEnvironment({ DB_PATH: path.join(dir, "data", "demo.sqlite") }, dir), /совпадает с рабочей базой/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+

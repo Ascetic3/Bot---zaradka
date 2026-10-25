@@ -360,3 +360,4 @@ test("экран связанных аккаунтов различает отс
     assert.doesNotMatch(restricted.payload.text, /СинтетическоеИмя|\+79991112233/);
   } finally { x.close(); }
 });
+

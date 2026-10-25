@@ -108,3 +108,4 @@ test("главное меню завершает редактирование а
     assert.equal(x.database.getDraft("telegram", "70001") ?? null, null);
   } finally { x.close(); }
 });
+

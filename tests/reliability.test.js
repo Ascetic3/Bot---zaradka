@@ -14,6 +14,7 @@ function setup() {
   process.env.OWNER_TELEGRAM_ID = String(ownerId);
   process.env.PRIVACY_POLICY_URL = "https://policy.invalid/test";
   process.env.PRIVACY_POLICY_VERSION = "test-policy-v1";
+  process.env.PRIVACY_POLICY_PUBLISHED = "true";
   for (const name of ["database", "registration", "admin", "myid"]) {
     const target = name === "database" ? "../src/database" : `../src/${name}`;
     delete require.cache[require.resolve(target)];
@@ -60,7 +61,7 @@ function setup() {
     close() {
       try { db.closeDatabase(); } catch {}
       fs.rmSync(dir, { recursive: true, force: true });
-      for (const key of ["DB_PATH", "OWNER_TELEGRAM_ID", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "DEMO_MODE"]) delete process.env[key];
+      for (const key of ["DB_PATH", "OWNER_TELEGRAM_ID", "PRIVACY_POLICY_URL", "PRIVACY_POLICY_VERSION", "PRIVACY_POLICY_PUBLISHED", "DEMO_MODE"]) delete process.env[key];
       for (const name of ["database", "registration", "admin", "myid"]) {
         const target = name === "database" ? "../src/database" : `../src/${name}`;
         delete require.cache[require.resolve(target)];
@@ -110,3 +111,4 @@ test("после возврата из меню регистрация прод�
     assert.equal(x.db.getDraft("telegram", userId).answers.first_name, "Алексей");
   } finally { x.close(); }
 });
+

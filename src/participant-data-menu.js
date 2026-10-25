@@ -44,7 +44,7 @@ function registerParticipantDataMenu(bot, { db = database, service = createParti
   bot.hears("🗑 Запросить удаление анкеты", async (ctx) => {
     if (!privateOnly(ctx)) return ctx.reply("Запрос удаления доступен только в личном чате с ботом.");
     if (!(await allowRequest(ctx, rateLimiter, "participant_data"))) return;
-    if (demoMode()) return renderMenu(ctx, "В демонстрационном режиме запросы и изменения синтетических анкет отключены.");
+    if (demoMode() && !db.isDemoTestParticipantForTelegram(actorId(ctx))) return renderMenu(ctx, "В демонстрационном режиме запросы доступны только для специально созданных тестовых анкет.");
     const prepared = service.prepareOwnDeletionRequest(actorId(ctx));
     if (prepared.status === "not_found") return renderMenu(ctx, "Связанная с вашим Telegram аккаунтом анкета не найдена.");
     if (prepared.status === "already_requested") return renderMenu(ctx, "Запрос удаления уже получен и ожидает рассмотрения.");
@@ -57,7 +57,7 @@ function registerParticipantDataMenu(bot, { db = database, service = createParti
   bot.hears("🚫 Отозвать согласие", async (ctx) => {
     if (!privateOnly(ctx)) return ctx.reply("Отзыв согласия доступен только в личном чате с ботом.");
     if (!(await allowRequest(ctx, rateLimiter, "participant_data"))) return;
-    if (demoMode()) return renderMenu(ctx, "В демонстрационном режиме действия с синтетическими анкетами отключены.");
+    if (demoMode() && !db.isDemoTestParticipantForTelegram(actorId(ctx))) return renderMenu(ctx, "В демонстрационном режиме отзыв доступен только для специально созданных тестовых анкет.");
     const prepared = service.prepareOwnConsentWithdrawal(actorId(ctx));
     if (prepared.status === "not_found") return renderMenu(ctx, "Связанная с вашим Telegram аккаунтом анкета не найдена.");
     if (prepared.status === "already_requested") return renderMenu(ctx, "Согласие уже отозвано. Обычная обработка анкеты ограничена.");
@@ -99,7 +99,7 @@ function registerParticipantDataMenu(bot, { db = database, service = createParti
       await removeInlineKeyboard(ctx);
       return renderMenu(ctx, "Слишком много запросов. Попробуйте немного позже.");
     }
-    if (demoMode()) {
+    if (demoMode() && !db.isDemoTestParticipantForTelegram(actor)) {
       service.cancelConfirmation(actor, token);
       await removeInlineKeyboard(ctx);
       return renderMenu(ctx, "В демонстрационном режиме изменения синтетических анкет отключены.");
@@ -120,3 +120,4 @@ function registerParticipantDataMenu(bot, { db = database, service = createParti
 }
 
 module.exports = { registerParticipantDataMenu, dataMenuKeyboard };
+

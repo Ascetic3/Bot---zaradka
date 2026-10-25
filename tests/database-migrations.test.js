@@ -62,7 +62,7 @@ test("новая пустая база проходит последовател
   try {
     const result = migrateDatabase(db);
     assert.equal(result.to, CURRENT_SCHEMA_VERSION);
-    assert.deepEqual(result.applied.map((step) => step.version), [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(result.applied.map((step) => step.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert.equal(inspectSchema(db, { allowKnownOptionalColumns: false }).version, CURRENT_SCHEMA_VERSION);
     assert.equal(db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_at"), true);
     assert.equal(db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_version"), true);
@@ -76,7 +76,7 @@ test("старая схема обновляется без потери уча�
     const participantId = fill(x.db);
     const preview = previewMigrations(x.db);
     assert.equal(preview.currentVersion, 1);
-    assert.deepEqual(preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9]);
     const result = migrateDatabase(x.db);
     assert.equal(result.to, CURRENT_SCHEMA_VERSION);
     assert.equal(x.db.prepare("SELECT first_name FROM participants WHERE id=?").get(participantId).first_name, "ВымышленноеИмя");
@@ -105,9 +105,9 @@ test("копия фактической клубной схемы с consent_at 
     const preview = previewMigrations(x.db);
     assert.equal(preview.currentVersion, 0);
     assert.equal(preview.structuralVersion, 2);
-    assert.deepEqual(preview.plan.map((step) => step.version), [3, 4, 5, 6, 7]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9]);
     const result = migrateDatabase(x.db);
-    assert.deepEqual(result.applied.map((step) => step.version), [3, 4, 5, 6, 7]);
+    assert.deepEqual(result.applied.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9]);
     const columns = x.db.prepare("PRAGMA table_info(participants)").all().map((column) => column.name);
     assert.equal(columns.filter((name) => name === "consent_at").length, 1);
     assert.equal(columns.includes("consent_version"), true);
@@ -122,10 +122,10 @@ test("полная схема версии 4 с user_version=0 применяе�
     const beforeDdl = x.db.prepare("SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY type,name").all();
     const preview = previewMigrations(x.db);
     assert.equal(preview.structuralVersion, 4);
-    assert.deepEqual(preview.plan.map((step) => step.version), [5, 6, 7]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [5, 6, 7, 8, 9]);
     const result = migrateDatabase(x.db);
     assert.equal(result.stampedVersion, true);
-    assert.deepEqual(result.applied.map((step) => step.version), [5, 6, 7]);
+    assert.deepEqual(result.applied.map((step) => step.version), [5, 6, 7, 8, 9]);
     assert.notDeepEqual(x.db.prepare("SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY type,name").all(), beforeDdl);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS count FROM consent_withdrawal_requests").get().count, 0);
     assert.equal(x.db.pragma("user_version", { simple: true }), CURRENT_SCHEMA_VERSION);
@@ -219,7 +219,7 @@ test("миграция v7 добавляет запросы удаления б�
   const x = fixture({ version: 1 });
   try {
     const participantId = fill(x.db);
-    assert.throws(() => migrateDatabase(x.db, { beforeVersionCommit(version) { if (version === 7) throw new Error("synthetic v7 failure"); } }), /synthetic v7 failure/);
+    assert.throws(() => migrateDatabase(x.db, { targetVersion: 7, beforeVersionCommit(version) { if (version === 7) throw new Error("synthetic v7 failure"); } }), /synthetic v7 failure/);
     assert.equal(x.db.pragma("user_version", { simple: true }), 6);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='participant_deletion_requests'").get().n, 0);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM participants").get().n, 1);
@@ -227,7 +227,7 @@ test("миграция v7 добавляет запросы удаления б�
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM admins").get().n, 1);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM registration_drafts").get().n, 1);
 
-    const migrated = migrateDatabase(x.db);
+    const migrated = migrateDatabase(x.db, { targetVersion: 7 });
     assert.deepEqual(migrated.applied.map((step) => step.version), [7]);
     assert.equal(x.db.pragma("user_version", { simple: true }), 7);
     assert.equal(inspectSchema(x.db, { allowKnownOptionalColumns: false }).version, 7);
@@ -238,9 +238,74 @@ test("миграция v7 добавляет запросы удаления б�
     x.db.prepare("INSERT INTO participant_deletion_requests(request_id,participant_id,requested_at) VALUES('synthetic-request-1',?,'2026-10-20T00:00:00.000Z')").run(participantId);
     assert.throws(() => x.db.prepare("INSERT INTO participant_deletion_requests(request_id,participant_id,requested_at) VALUES('synthetic-request-2',?,'2026-10-20T00:01:00.000Z')").run(participantId), /UNIQUE/);
     const before = x.db.prepare("SELECT COUNT(*) AS n FROM participant_deletion_requests").get().n;
-    assert.deepEqual(migrateDatabase(x.db).applied, []);
+    assert.deepEqual(migrateDatabase(x.db, { targetVersion: 7 }).applied, []);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM participant_deletion_requests").get().n, before);
     assert.equal(x.db.prepare("SELECT first_name FROM participants WHERE id=?").get(participantId).first_name, "ВымышленноеИмя");
+  } finally { x.close(); }
+});
+
+test("миграция v8 перестраивает фактическую схему v7 и сохраняет историю запросов", () => {
+  const x = fixture({ version: 1 });
+  try {
+    const participantIds = [fill(x.db)];
+    for (const suffix of [2, 3]) {
+      const result = x.db.prepare("INSERT INTO participants(first_name,last_name,phone) VALUES(?,?,?)")
+        .run("ВымышленноеИмя", "ТестоваяФамилия", `+9997000000${suffix}`);
+      participantIds.push(Number(result.lastInsertRowid));
+    }
+    migrateDatabase(x.db, { targetVersion: 7 });
+    const insert = x.db.prepare("INSERT INTO participant_deletion_requests(request_id,participant_id,requested_at,status) VALUES(?,?,?,?)");
+    insert.run("synthetic-v7-pending", participantIds[0], "2026-10-20T10:00:00.000Z", "pending_review");
+    insert.run("synthetic-v7-processed", participantIds[1], "2026-10-20T10:01:00.000Z", "processed");
+    insert.run("synthetic-v7-na", participantIds[2], "2026-10-20T10:02:00.000Z", "not_applicable");
+    const before = x.db.prepare("SELECT id,request_id,participant_id,requested_at,status FROM participant_deletion_requests ORDER BY id").all();
+
+    assert.throws(() => migrateDatabase(x.db, { beforeVersionCommit(version) { if (version === 8) throw new Error("synthetic v8 failure"); } }), /synthetic v8 failure/);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 7);
+    assert.deepEqual(x.db.prepare("SELECT id,request_id,participant_id,requested_at,status FROM participant_deletion_requests ORDER BY id").all(), before);
+    assert.ok(x.db.pragma("index_list(participant_deletion_requests)").some((index) => index.unique && !index.partial && x.db.pragma(`index_info(${JSON.stringify(index.name)})`).some((column) => column.name === "participant_id")));
+
+    const migrated = migrateDatabase(x.db, { targetVersion: 8 });
+    assert.deepEqual(migrated.applied.map((step) => step.version), [8]);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 8);
+    assert.deepEqual(x.db.prepare("SELECT id,request_id,participant_id,requested_at,status FROM participant_deletion_requests ORDER BY id").all(), before);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM participants").get().n, 3);
+    const indexes = x.db.pragma("index_list(participant_deletion_requests)");
+    assert.equal(indexes.some((index) => index.unique && !index.partial && x.db.pragma(`index_info(${JSON.stringify(index.name)})`).some((column) => column.name === "participant_id")), false);
+    assert.ok(indexes.some((index) => index.name === "uq_participant_deletion_requests_active" && index.unique && index.partial));
+    assert.ok(indexes.some((index) => index.name === "idx_participant_deletion_requests_status" && !index.unique));
+    assert.ok(x.db.pragma("foreign_key_list(participant_deletion_requests)").some((fk) => fk.table === "participants" && fk.from === "participant_id" && fk.to === "id" && fk.on_delete === "SET NULL"));
+    assert.equal(x.db.pragma("integrity_check", { simple: true }), "ok");
+    assert.equal(x.db.pragma("foreign_key_check").length, 0);
+    assert.deepEqual(migrateDatabase(x.db, { targetVersion: 8 }).applied, []);
+
+    insert.run("synthetic-v8-new-after-processed", participantIds[1], "2026-10-20T10:03:00.000Z", "pending_review");
+    assert.throws(() => insert.run("synthetic-v8-duplicate-active", participantIds[1], "2026-10-20T10:04:00.000Z", "pending_review"), /UNIQUE/);
+  } finally { x.close(); }
+});
+
+test("миграция v9 добавляет маркеры только для тестовых участников и откатывается атомарно", () => {
+  const x = fixture({ version: 1 });
+  try {
+    const participantId = fill(x.db);
+    migrateDatabase(x.db, { targetVersion: 8 });
+    assert.throws(() => migrateDatabase(x.db, { beforeVersionCommit(version) { if (version === 9) throw new Error("synthetic v9 failure"); } }), /synthetic v9 failure/);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 8);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='demo_test_participants'").get().n, 0);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM participants").get().n, 1);
+    const result = migrateDatabase(x.db);
+    assert.deepEqual(result.applied.map((step) => step.version), [9]);
+    const schema = inspectSchema(x.db);
+    assert.equal(schema.version, 9);
+    assert.ok(x.db.pragma("foreign_key_list(demo_test_participants)").some((fk) => fk.table === "participants" && fk.from === "participant_id" && fk.on_delete === "CASCADE"));
+    assert.ok(x.db.pragma("index_list(demo_test_participants)").some((index) => index.name === "idx_demo_test_participants_created_at" && !index.unique));
+    x.db.prepare("INSERT INTO demo_test_participants(participant_id) VALUES(?)").run(participantId);
+    assert.throws(() => x.db.prepare("INSERT INTO demo_test_participants(participant_id) VALUES(?)").run(participantId), /UNIQUE/);
+    x.db.prepare("DELETE FROM participants WHERE id=?").run(participantId);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM demo_test_participants").get().n, 0);
+    assert.equal(x.db.pragma("integrity_check", { simple: true }), "ok");
+    assert.equal(x.db.pragma("foreign_key_check").length, 0);
+    assert.deepEqual(migrateDatabase(x.db).applied, []);
   } finally { x.close(); }
 });
 
@@ -285,7 +350,7 @@ test("режим предварительной проверки миграци�
   try {
     const result = runMigrationCommand({ mode: "check", databasePath: x.file });
     assert.equal(result.preview.currentVersion, 1);
-    assert.deepEqual(result.preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(result.preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9]);
     assert.equal(x.db.pragma("user_version", { simple: true }), 1);
     assert.equal(x.db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_at"), false);
   } finally { x.close(); }
@@ -324,3 +389,4 @@ test("CLI применяет только явно подтверждённую 
     assert.equal(fs.existsSync(missing), false);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
+

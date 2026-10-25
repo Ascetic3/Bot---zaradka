@@ -145,3 +145,4 @@ test("общий порядок обработчиков сохраняет ко
     assert.ok(x.buttons(profile).includes("✏️ Изменить данные"));
   } finally { x.close(); }
 });
+

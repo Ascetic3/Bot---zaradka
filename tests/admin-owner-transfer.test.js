@@ -67,3 +67,4 @@ test("ошибка внутри передачи откатывает обе с�
     assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM admins WHERE role='owner'").get().count, 1);
   } finally { x.close(); }
 });
+

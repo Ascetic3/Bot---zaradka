@@ -49,3 +49,4 @@ function readBackupSettings(env = process.env) {
 }
 
 module.exports = { getDatabasePath, getBackupDirectory, readBackupSettings, normalizeDatabasePath, classifyDatabasePath };
+

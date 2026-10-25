@@ -336,3 +336,4 @@ test("отмена выгрузки Excel возвращает подходящ�
     assert.equal(x.buttons(response).includes("Отмена"), false);
   } finally { x.close(); }
 });
+

@@ -11,6 +11,7 @@ function setup(policy = "https://policy.invalid/test") {
   process.env.DB_PATH = path.join(dir, "registration.sqlite");
   process.env.PRIVACY_POLICY_URL = policy;
   process.env.PRIVACY_POLICY_VERSION = "test-policy-v1";
+  process.env.PRIVACY_POLICY_PUBLISHED = "true";
   process.env.PHONE_PROOF_SECRET = "synthetic-registration-test-secret-v1";
   delete require.cache[require.resolve("../src/database")];
   delete require.cache[require.resolve(modulePath)];
@@ -22,16 +23,18 @@ function setup(policy = "https://policy.invalid/test") {
   const bot = new Bot("123456:TEST_TOKEN_NOT_REAL", { botInfo: { id: 123456, is_bot: true, first_name: "Test", username: "test_bot" } });
   require(modulePath).registerRegistration(bot);
   async function send(message) {
-    const update = { update_id: Math.floor(Math.random()*1e9), message: { message_id: 1, date: 1, chat: { id: userId, type: "private" }, from: { id: userId, is_bot: false, first_name: "Тест" }, ...message } };
+    const draft = message.text === "Согласен" ? db.getDraft("telegram", userId) : null;
+    const update = draft?.current_step === "consent" ? { update_id: Math.floor(Math.random()*1e9), callback_query: { id: `cb-${Math.random()}`, from: { id: userId, is_bot: false, first_name: "Тест" }, chat_instance: "test", data: `mconsent:a:${draft.answers.consent_nonce}`, message: { message_id: 1, date: 1, chat: { id: userId, type: "private" }, from: { id: 123456, is_bot: true, first_name: "Test" }, text: "Согласие" } } } : { update_id: Math.floor(Math.random()*1e9), message: { message_id: 1, date: 1, chat: { id: userId, type: "private" }, from: { id: userId, is_bot: false, first_name: "Тест" }, ...message } };
     let response;
     bot.api.config.use(async (prev, method, payload, signal) => {
       if (method === "sendMessage") { response = payload.text; return { ok: true, result: { message_id: 2, date: 1, chat: { id: userId, type: "private" }, text: payload.text } }; }
-      return prev(method, payload, signal);
+      if (method === "answerCallbackQuery" || method === "editMessageReplyMarkup") return { ok: true, result: true };
+      return { ok: true, result: true };
     });
     await bot.handleUpdate(update);
     return response;
   }
-  return { db, send, getLastDbError: () => lastDbError, close() { db.closeDatabase(); fs.rmSync(dir, { recursive: true, force: true }); delete process.env.DB_PATH; delete process.env.PRIVACY_POLICY_URL; delete process.env.PRIVACY_POLICY_VERSION; delete process.env.PHONE_PROOF_SECRET; delete process.env.DEMO_MODE; delete require.cache[require.resolve("../src/participant-service")]; } };
+  return { db, send, getLastDbError: () => lastDbError, close() { db.closeDatabase(); fs.rmSync(dir, { recursive: true, force: true }); delete process.env.DB_PATH; delete process.env.PRIVACY_POLICY_URL; delete process.env.PRIVACY_POLICY_VERSION; delete process.env.PRIVACY_POLICY_PUBLISHED; delete process.env.PHONE_PROOF_SECRET; delete process.env.DEMO_MODE; delete require.cache[require.resolve("../src/participant-service")]; } };
 }
 const message = (text) => ({ text });
 const contact = (id, number = "+79001234567") => ({ contact: { phone_number: number, user_id: id } });
@@ -254,5 +257,6 @@ test("повторное подтверждение готовой анкеты 
     assert.equal(x.db.db.prepare("SELECT COUNT(*) AS count FROM accounts WHERE platform='telegram' AND messenger_user_id=?").get(String(userId)).count, 1);
   } finally { x.close(); }
 });
+
 
 

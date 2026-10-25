@@ -11,3 +11,4 @@ function registerMyId(bot, { rateLimiter = createRateLimiter() } = {}) {
   });
 }
 module.exports = { registerMyId };
+

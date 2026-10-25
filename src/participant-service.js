@@ -70,9 +70,11 @@ function validateParticipantUpdate(participant, field, value) {
 function getRegistrationPolicy(env = process.env) {
   const url = String(env.PRIVACY_POLICY_URL ?? "").trim();
   const version = String(env.PRIVACY_POLICY_VERSION ?? "").trim();
-  let validUrl = false;
-  try { validUrl = ["https:", "http:"].includes(new URL(url).protocol); } catch {}
-  return validUrl && version ? { url, version } : null;
+  const published = String(env.PRIVACY_POLICY_PUBLISHED ?? "").trim().toLowerCase() === "true";
+  let parsedUrl = null;
+  try { parsedUrl = new URL(url); } catch {}
+  const validUrl = parsedUrl?.protocol === "https:" && Boolean(parsedUrl.hostname) && !parsedUrl.username && !parsedUrl.password;
+  return published && validUrl && version ? { url, version } : null;
 }
 
 function validateRegistration(answers, policy = getRegistrationPolicy(), account = null, options = {}) {
@@ -249,3 +251,4 @@ module.exports = {
   registrationService: defaultRegistrationService,
   fieldLimits
 };
+

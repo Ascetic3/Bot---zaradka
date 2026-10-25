@@ -136,3 +136,4 @@ test("обработчики сигналов можно установить и
   assert.equal(emitter.listenerCount("SIGINT"), 0);
   assert.equal(emitter.listenerCount("SIGTERM"), 0);
 });
+

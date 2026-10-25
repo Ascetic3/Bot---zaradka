@@ -7,7 +7,7 @@ const BetterSqlite3 = require("better-sqlite3");
 const { createBackupManager, verifyBackupFile, restoreBackup, startAutomaticBackups, requiredTables } = require("../src/database/backup");
 const { createBackupFromDatabaseFile } = require("../src/database/backup-cli");
 const { readBackupSettings, classifyDatabasePath } = require("../src/database/config");
-const { createBaseSchema, migrateDatabase } = require("../src/database/migrations");
+const { createBaseSchema, migrateDatabase, CURRENT_SCHEMA_VERSION } = require("../src/database/migrations");
 
 function setupDatabase() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "magic-backup-test-"));
@@ -302,7 +302,7 @@ test("интеграционный сценарий: копия старой с�
     assert.equal(verifyBackupFile(backup.path, { requireMetadata: true }), true);
 
     migrateDatabase(sourceDb);
-    assert.equal(sourceDb.pragma("user_version", { simple: true }), 7);
+    assert.equal(sourceDb.pragma("user_version", { simple: true }), CURRENT_SCHEMA_VERSION);
     assert.equal(sourceDb.prepare("SELECT first_name FROM participants WHERE id=?").get(person.lastInsertRowid).first_name, "СинтетическоеИмя");
     assert.equal(sourceDb.prepare("SELECT COUNT(*) AS n FROM registration_drafts").get().n, 1);
 
@@ -319,7 +319,7 @@ test("интеграционный сценарий: копия старой с�
     assert.equal(restored.prepare("SELECT current_step FROM registration_drafts WHERE messenger_user_id='700000011'").get().current_step, "city");
     assert.deepEqual(restored.prepare("PRAGMA foreign_key_check").all(), []);
     migrateDatabase(restored);
-    assert.equal(restored.pragma("user_version", { simple: true }), 7);
+    assert.equal(restored.pragma("user_version", { simple: true }), CURRENT_SCHEMA_VERSION);
     assert.equal(restored.prepare("SELECT first_name FROM participants WHERE phone=?").get("+99970000009").first_name, "СинтетическоеИмя");
   } finally {
     try { restored?.close(); } catch {}
@@ -466,3 +466,4 @@ test("остановка планировщика ждёт завершения 
   await stopping;
   assert.equal(stopped, true);
 });
+

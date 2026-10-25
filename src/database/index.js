@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const { getDatabasePath } = require("./config");
+const { normalizeDatabasePath } = require("./config");
 const { initializeEmptyDatabase, CURRENT_SCHEMA_VERSION } = require("./migrations");
 
 const dbPath = getDatabasePath();
@@ -40,6 +41,33 @@ function addParticipant(data, account = null) {
 function findParticipantByPhone(phone) { return db.prepare("SELECT * FROM participants WHERE phone=?").get(normalizePhone(phone)); }
 function findParticipantByTelegramId(id) { return db.prepare("SELECT p.* FROM participants p JOIN accounts a ON a.participant_id=p.id WHERE a.platform='telegram' AND a.messenger_user_id=? AND p.consent_withdrawn_at IS NULL").get(String(id)); }
 function findParticipantByTelegramIdIncludingWithdrawn(id) { return db.prepare("SELECT p.* FROM participants p JOIN accounts a ON a.participant_id=p.id WHERE a.platform='telegram' AND a.messenger_user_id=?").get(String(id)); }
+function isDemoTestParticipant(participantId) { return Boolean(db.prepare("SELECT 1 FROM demo_test_participants WHERE participant_id=?").get(Number(participantId))); }
+function isDemoTestParticipantForTelegram(telegramId) {
+  return Boolean(db.prepare(`SELECT 1 FROM demo_test_participants t JOIN accounts a ON a.participant_id=t.participant_id
+    WHERE a.platform='telegram' AND a.messenger_user_id=?`).get(String(telegramId)));
+}
+function requireDemoTestWrite(actorTelegramId, projectRoot) {
+  if (String(process.env.DEMO_MODE).toLowerCase() !== "true") throw Object.assign(new Error("Тестовые анкеты доступны только в DEMO_MODE."), { code: "DEMO_MODE_REQUIRED" });
+  const expectedPath = path.join(projectRoot, "data", "demo.sqlite");
+  if (normalizeDatabasePath(dbPath) !== normalizeDatabasePath(expectedPath)) throw Object.assign(new Error("Запись тестовых анкет остановлена: подключение не указывает на demo.sqlite."), { code: "DEMO_DATABASE_MISMATCH" });
+  const role = getAdminRole(actorTelegramId);
+  if (!new Set(["owner", "admin"]).has(role)) throw Object.assign(new Error("Тестовая регистрация доступна только действующему администратору."), { code: "DEMO_ADMIN_REQUIRED" });
+}
+function createDemoTestParticipant(data, telegramId, { projectRoot = path.resolve(__dirname, "../..") } = {}) {
+  requireDemoTestWrite(telegramId, projectRoot);
+  const phone = normalizePhone(data.phone);
+  if (!/^\+7000000\d{4}$/.test(phone)) throw Object.assign(new Error("Разрешён только вымышленный тестовый номер формата +7000000XXXX."), { code: "DEMO_TEST_PHONE_INVALID" });
+  const actor = String(telegramId);
+  return db.transaction(() => {
+    requireDemoTestWrite(actor, projectRoot);
+    if (findParticipantByTelegramIdIncludingWithdrawn(actor)) return { status: "account_already_registered" };
+    if (findParticipantByPhone(phone)) return { status: "phone_already_registered" };
+    const saved = addParticipant({ ...data, phone, phone_confirmed_at: new Date().toISOString(), personal_data_consent: true,
+      consent_at: new Date().toISOString(), consent_version: "DEMO_TEST_ONLY_V1" }, { platform: "telegram", messenger_user_id: actor });
+    db.prepare("INSERT INTO demo_test_participants(participant_id,created_at) VALUES(?,?)").run(saved.id, new Date().toISOString());
+    return { status: "created", participant: saved };
+  }).immediate();
+}
 function listLinkedPlatformsForTelegram(telegramId) {
   return db.prepare(`SELECT a.platform FROM accounts a JOIN participants p ON p.id=a.participant_id
     WHERE a.participant_id=(SELECT participant_id FROM accounts WHERE platform='telegram' AND messenger_user_id=? LIMIT 1)
@@ -377,8 +405,10 @@ function getParticipantStatistics() {
 function getParticipantsForExport() {
   return db.prepare(`SELECT p.id, p.first_name, p.last_name, p.phone, p.city, p.email,
       p.preferred_contact, p.referral_source, p.registered_at, p.phone_confirmed_at, p.consent_at,
+      CASE WHEN demo_test.participant_id IS NULL THEN 0 ELSE 1 END AS demo_test,
       telegram.messenger_user_id AS telegram_id, max_account.messenger_user_id AS max_id
     FROM participants AS p
+    LEFT JOIN demo_test_participants demo_test ON demo_test.participant_id=p.id
     LEFT JOIN accounts AS telegram ON telegram.participant_id=p.id AND telegram.platform='telegram'
     LEFT JOIN accounts AS max_account ON max_account.participant_id=p.id AND max_account.platform='max'
     WHERE p.consent_withdrawn_at IS NULL ORDER BY p.id ASC`).all();
@@ -407,6 +437,18 @@ function deleteParticipantById(participantId) {
     error.code = "DEMO_MODE_DELETE_DISABLED";
     throw error;
   }
+  return deleteParticipantTransaction(participantId);
+}
+function deleteDemoTestParticipantById(participantId, actorTelegramId, { projectRoot = path.resolve(__dirname, "../..") } = {}) {
+  requireDemoTestWrite(actorTelegramId, projectRoot);
+  const id = Number(participantId);
+  return db.transaction(() => {
+    requireDemoTestWrite(actorTelegramId, projectRoot);
+    if (!isDemoTestParticipant(id)) throw Object.assign(new Error("Удалять разрешено только специально помеченные тестовые анкеты."), { code: "DEMO_TEST_PARTICIPANT_REQUIRED" });
+    return deleteParticipantTransaction(id);
+  }).immediate();
+}
+function deleteParticipantTransaction(participantId) {
   const id = Number(participantId);
   if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Нужен действительный внутренний ID участника.");
   return db.transaction(() => {
@@ -414,6 +456,11 @@ function deleteParticipantById(participantId) {
     if (!preview) return { deleted: false, participant_id: id, accounts_deleted: 0, registration_drafts_deleted: 0, withdrawal_requests_deleted: 0 };
     const draftsDeleted = db.prepare(`DELETE FROM registration_drafts
       WHERE EXISTS (SELECT 1 FROM accounts a WHERE a.participant_id=? AND a.platform=registration_drafts.platform AND a.messenger_user_id=registration_drafts.messenger_user_id)`).run(id).changes;
+    // Keep the minimal request record, but close the pending item in the same
+    // transaction as the participant deletion. ON DELETE SET NULL removes the
+    // link to the participant after the request has been marked processed.
+    const deletionRequestsProcessed = db.prepare(`UPDATE participant_deletion_requests
+      SET status='processed' WHERE participant_id=? AND status='pending_review'`).run(id).changes;
     const participantDeleted = db.prepare("DELETE FROM participants WHERE id=?").run(id).changes;
     if (participantDeleted !== 1) throw new Error("Анкета изменилась во время удаления; транзакция отменена.");
     return {
@@ -421,6 +468,7 @@ function deleteParticipantById(participantId) {
       participant_id: id,
       accounts_deleted: preview.linked_accounts.length,
       registration_drafts_deleted: draftsDeleted,
+      deletion_requests_processed: deletionRequestsProcessed,
       withdrawal_requests_deleted: preview.consent_withdrawal_requests
     };
   }).immediate();
@@ -484,7 +532,7 @@ function createParticipantDeletionRequestForTelegram(telegramId, requestId, requ
     const owner = db.prepare("SELECT p.id FROM participants p JOIN accounts a ON a.participant_id=p.id WHERE a.platform='telegram' AND a.messenger_user_id=?").get(actor);
     if (!owner) return { status: "not_found" };
     const existing = db.prepare("SELECT request_id,requested_at,status FROM participant_deletion_requests WHERE participant_id=? AND status='pending_review'").get(owner.id);
-    if (existing) return { status: "already_requested", ...existing };
+    if (existing) return { ...existing, status: "already_requested", request_status: existing.status };
     db.prepare("INSERT INTO participant_deletion_requests(request_id,participant_id,requested_at,status) VALUES(?,?,?,'pending_review')").run(request, owner.id, when.toISOString());
     return { status: "received", request_id: request, requested_at: when.toISOString(), request_status: "pending_review" };
   }).immediate();
@@ -512,6 +560,12 @@ function listParticipantDataRequests(limit = 50, offset = 0) {
       SELECT 'consent_withdrawal' AS request_type, CAST(id AS TEXT) AS request_id, requested_at, status FROM consent_withdrawal_requests
     ) ORDER BY requested_at DESC, request_type, request_id LIMIT ? OFFSET ?`).all(safeLimit, safeOffset);
 }
+function listDemoTestDeletionRequests(limit = 10) {
+  const safeLimit = Math.max(1, Math.min(Number.parseInt(limit, 10) || 10, 50));
+  return db.prepare(`SELECT d.request_id, d.participant_id, d.requested_at, d.status
+    FROM participant_deletion_requests d JOIN demo_test_participants t ON t.participant_id=d.participant_id
+    WHERE d.status='pending_review' ORDER BY d.requested_at,d.request_id LIMIT ?`).all(safeLimit);
+}
 function getParticipantDataRequestCount() {
   return db.prepare(`SELECT COUNT(*) AS count FROM (
       SELECT request_id FROM participant_deletion_requests
@@ -520,4 +574,5 @@ function getParticipantDataRequestCount() {
     )`).get().count;
 }
 function closeDatabase() { db.close(); }
-module.exports = { db, dbPath, schemaVersion: CURRENT_SCHEMA_VERSION, normalizePhone, addParticipant, registerParticipant, findParticipantByPhone, findParticipantByTelegramId, findParticipantByTelegramIdIncludingWithdrawn, listLinkedPlatformsForTelegram, listAccountLinkRequestsForTelegram, getAccountLinkRequestForTelegram, getParticipant, getParticipantIncludingWithdrawn, searchParticipants, listParticipants, updateParticipant, updatePhoneFromVerifiedTelegramContact, linkAccount, createAccountLinkRequest, transitionAccountLinkRequest, completeAccountLinkRequest, saveDraft, getDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, transferOwner, updateAdminUsername, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, getParticipantDeletionPreview, deleteParticipantById, getParticipantConsentState, recordConsentWithdrawalRequest, getConsentWithdrawalRequest, resolveConsentWithdrawalRequest, createParticipantDeletionRequestForTelegram, getParticipantDataRequestsForTelegram, listParticipantDataRequests, getParticipantDataRequestCount, closeDatabase };
+module.exports = { db, dbPath, schemaVersion: CURRENT_SCHEMA_VERSION, normalizePhone, addParticipant, registerParticipant, createDemoTestParticipant, isDemoTestParticipant, isDemoTestParticipantForTelegram, findParticipantByPhone, findParticipantByTelegramId, findParticipantByTelegramIdIncludingWithdrawn, listLinkedPlatformsForTelegram, listAccountLinkRequestsForTelegram, getAccountLinkRequestForTelegram, getParticipant, getParticipantIncludingWithdrawn, searchParticipants, listParticipants, updateParticipant, updatePhoneFromVerifiedTelegramContact, linkAccount, createAccountLinkRequest, transitionAccountLinkRequest, completeAccountLinkRequest, saveDraft, getDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, transferOwner, updateAdminUsername, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, getParticipantDeletionPreview, deleteParticipantById, deleteDemoTestParticipantById, getParticipantConsentState, recordConsentWithdrawalRequest, getConsentWithdrawalRequest, resolveConsentWithdrawalRequest, createParticipantDeletionRequestForTelegram, getParticipantDataRequestsForTelegram, listParticipantDataRequests, listDemoTestDeletionRequests, getParticipantDataRequestCount, closeDatabase };
+

@@ -1,16 +1,50 @@
-const { Keyboard } = require("grammy");
+const crypto = require("node:crypto");
+const { Keyboard, InlineKeyboard } = require("grammy");
 const { isPrivateChat } = require("./chat-guards");
 const { registrationFlow } = require("./registration");
 const db = require("./database");
 const { validateFieldValue } = require("./participant-service");
 const { createRateLimiter, allowRequest } = require("./request-limits");
 const { ExpiringMap } = require("./expiring-map");
+const { mainMenuKeyboard, mainMenuText } = require("./main-menu");
 
 const TEST_PHONE = "+70000000000";
 const CANCEL = "❌ Отмена";
 const TEST_PHONE_BUTTON = "🧪 Использовать тестовый номер";
 const states = new ExpiringMap(30 * 60_000);
 const { prompts, order, optional, values, fieldNames } = registrationFlow;
+
+async function clearRegistrationPreviewSession(userId, ctx) {
+  const state = states.get(String(userId));
+  if (state?.consentChatId && state?.consentMessageId) {
+    try { await ctx.api.editMessageReplyMarkup({ chat_id: state.consentChatId, message_id: state.consentMessageId, reply_markup: { inline_keyboard: [] } }); } catch {}
+  }
+  return states.delete(String(userId));
+}
+
+function getPreviewPolicyUrl() {
+  const raw = String(process.env.PREVIEW_POLICY_URL ?? "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function consentScreen(url, nonce) {
+  const safeUrl = url.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const text = "<b>Демонстрационный экран согласия</b>\n\n" +
+    "Перед вопросами ознакомьтесь с <a href=\"" + safeUrl + "\">политикой обработки персональных данных</a>.\n\n" +
+    "Это тестовый экран. Нажатие кнопки не фиксирует согласие и не сохраняет данные.";
+  const keyboard = new InlineKeyboard()
+    .text("✅ Принимаю", "mpreview:accept:" + nonce)
+    .row()
+    .text("❌ Отказываюсь", "mpreview:decline:" + nonce);
+  return { text, keyboard };
+}
 
 function questionKeyboard(step) {
   const keyboard = new Keyboard();
@@ -40,27 +74,104 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
   const replySummary = (ctx, state) => ctx.reply(summaryText(state.answers), {
     reply_markup: new Keyboard().text("✅ Подтвердить регистрацию").row().text("✏️ Исправить данные").row().text(CANCEL).resized()
   });
-  const authorized = (ctx) => isPrivateChat(ctx) && ctx.from && getRole(ctx.from.id) === "owner";
+  const authorized = (ctx) => isPrivateChat(ctx) && ctx.from && Boolean(getRole(ctx.from.id));
+  const removeConsentButtons = async (ctx) => {
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch { /* stale messages are harmless after the in-memory nonce is consumed */ }
+  };
+  const removeStoredConsentButtons = async (ctx, state) => {
+    if (!state?.consentChatId || !state?.consentMessageId) return;
+    try {
+      await ctx.api.editMessageReplyMarkup({
+        chat_id: state.consentChatId,
+        message_id: state.consentMessageId,
+        reply_markup: { inline_keyboard: [] }
+      });
+    } catch { /* the message may already be gone or its buttons already removed */ }
+  };
 
   bot.command("preview_registration", async (ctx) => {
     if (!isPrivateChat(ctx)) return ctx.reply("Предварительный просмотр доступен только в личном чате с ботом.");
-    if (!ctx.from || getRole(ctx.from.id) !== "owner") return ctx.reply("Предварительный просмотр доступен только владельцу клуба.");
+    if (!authorized(ctx)) {
+      const previousState = ctx.from ? states.get(String(ctx.from.id)) : null;
+      await removeStoredConsentButtons(ctx, previousState);
+      if (ctx.from) states.delete(String(ctx.from.id));
+      return ctx.reply("Предварительный просмотр доступен только владельцу или действующему администратору клуба.");
+    }
     if (!(await allowRequest(ctx, rateLimiter, "preview"))) return;
+    const policyUrl = getPreviewPolicyUrl();
+    if (!policyUrl) return ctx.reply("Для тестового экрана согласия нужна отдельная настройка PREVIEW_POLICY_URL: опубликуйте файл public/demo-policy.html на своей публичной HTTPS-странице и укажите её фактический адрес. Файл пока не опубликован; произвольную ссылку бот не подставляет.");
     let state = states.get(String(ctx.from.id));
     if (!state) {
-      state = { step: "first_name", answers: {}, editing: false, awaitingReferralDetail: false };
+      state = { step: "consent", consentNonce: crypto.randomBytes(16).toString("hex"), consentUrl: policyUrl, answers: {}, editing: false, awaitingReferralDetail: false };
       states.set(String(ctx.from.id), state);
-      await ctx.reply("Запущен демонстрационный режим. Ответы не сохраняются в базе данных.");
+    }
+    if (state.step === "consent") {
+      if (state.consentUrl !== policyUrl) {
+        state.consentNonce = crypto.randomBytes(16).toString("hex");
+        state.consentUrl = policyUrl;
+      }
+      const screen = consentScreen(policyUrl, state.consentNonce);
+      const message = await ctx.reply(screen.text, { parse_mode: "HTML", reply_markup: screen.keyboard });
+      state.consentChatId = message.chat.id;
+      state.consentMessageId = message.message_id;
+      return message;
     }
     return state.step === "confirm" ? replySummary(ctx, state) : replyQuestion(ctx, state);
+  });
+
+  bot.callbackQuery(/^mpreview:(accept|decline):([a-f0-9]{32})$/, async (ctx) => {
+    if (!isPrivateChat(ctx) || !ctx.from || String(ctx.chat?.id) !== String(ctx.from.id)) {
+      return ctx.answerCallbackQuery({ text: "Предварительный просмотр доступен только в личном чате с ботом." });
+    }
+    if (!authorized(ctx)) {
+      const revokedState = states.get(String(ctx.from.id));
+      await removeConsentButtons(ctx);
+      await removeStoredConsentButtons(ctx, revokedState);
+      states.delete(String(ctx.from.id));
+      return ctx.answerCallbackQuery({ text: "Доступ к предварительному просмотру отозван." });
+    }
+    const [, action, nonce] = ctx.match;
+    const key = String(ctx.from.id);
+    const state = states.get(key);
+    const activeUrl = getPreviewPolicyUrl();
+    if (!state || state.step !== "consent" || state.consentNonce !== nonce || state.consentUrl !== activeUrl) {
+      return ctx.answerCallbackQuery({ text: "Кнопка устарела или уже обработана." });
+    }
+    if (action === "decline") {
+      states.delete(key);
+      await ctx.answerCallbackQuery({ text: "Предварительный просмотр завершён." });
+      await removeConsentButtons(ctx);
+      return ctx.reply("Предварительный просмотр отменён. Данные не сохранялись.\n\n" + mainMenuText, { reply_markup: mainMenuKeyboard });
+    }
+    const policyUrl = getPreviewPolicyUrl();
+    if (!policyUrl) {
+      states.delete(key);
+      await ctx.answerCallbackQuery({ text: "Тестовая ссылка не настроена." });
+      await removeConsentButtons(ctx);
+      return ctx.reply("Экран не может продолжиться: настройте PREVIEW_POLICY_URL после публикации демонстрационной страницы по HTTPS.", { reply_markup: mainMenuKeyboard });
+    }
+    state.step = "first_name";
+    state.consentNonce = null;
+    state.consentUrl = null;
+    state.consentChatId = null;
+    state.consentMessageId = null;
+    await ctx.answerCallbackQuery({ text: "Переходим к демонстрационным вопросам." });
+    await removeConsentButtons(ctx);
+    return replyQuestion(ctx, state);
   });
 
   bot.on("message:text", async (ctx, next) => {
     if (!ctx.from || !states.has(String(ctx.from.id))) return next();
     const input = ctx.message.text.trim();
+    if (/^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(input)) {
+      await removeStoredConsentButtons(ctx, states.get(String(ctx.from.id)));
+      states.delete(String(ctx.from.id));
+      return next();
+    }
     if (/^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(input)) return next();
     if (!isPrivateChat(ctx)) return ctx.reply("Предварительный просмотр доступен только в личном чате с ботом.");
-    if (getRole(ctx.from.id) !== "owner") {
+    if (!authorized(ctx)) {
+      await removeStoredConsentButtons(ctx, states.get(String(ctx.from.id)));
       states.delete(String(ctx.from.id));
       return ctx.reply("Доступ к предварительному просмотру отозван.");
     }
@@ -68,13 +179,16 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
     const key = String(ctx.from.id);
     const state = states.get(key);
     if (input === "🏠 Главное меню") {
+      await removeStoredConsentButtons(ctx, state);
       states.delete(key);
       return next();
     }
+    if (state.step === "consent") return ctx.reply("Сначала выберите «✅ Принимаю» или «❌ Отказываюсь» под демонстрационным экраном.");
     if (input === "🔗 Связанные аккаунты") return next();
     if (input === CANCEL || input === "❌ Отменить регистрацию" || input === "Отмена") {
+      await removeStoredConsentButtons(ctx, state);
       states.delete(key);
-      return ctx.reply("Предварительный просмотр отменён. Данные не сохранены.");
+      return ctx.reply("Предварительный просмотр отменён. Данные не сохранены.\n\n" + mainMenuText, { reply_markup: mainMenuKeyboard });
     }
     if (!(await allowRequest(ctx, rateLimiter, "preview_continue"))) return;
 
@@ -177,4 +291,5 @@ function registerRegistrationPreview(bot, { database = db, getRole = (id) => dat
   return () => states.stop();
 }
 
-module.exports = { registerRegistrationPreview, previewTestPhone: TEST_PHONE };
+module.exports = { registerRegistrationPreview, clearRegistrationPreviewSession, previewTestPhone: TEST_PHONE, getPreviewPolicyUrl, previewConsentScreen: consentScreen };
+

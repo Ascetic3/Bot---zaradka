@@ -66,10 +66,24 @@ function assertSeedMatches(database, records, metadata) {
     throw new Error("Версия демонстрационного набора не совпадает. Существующие данные не изменены.");
   }
   const hasConsentVersion = connection.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_version");
-  const consentVersionSelect = hasConsentVersion ? "consent_version" : "NULL AS consent_version";
-  const actual = connection.prepare(`SELECT id, first_name, last_name, phone, city, email, preferred_contact, referral_source,
-      registered_at, updated_at, phone_confirmed_at, personal_data_consent, consent_at, ${consentVersionSelect} FROM participants ORDER BY id`).all();
-  if (actual.length !== records.length) throw new Error("Демонстрационная база изменена после заполнения. Повторное заполнение остановлено без изменений.");
+  const consentVersionSelect = hasConsentVersion ? "p.consent_version" : "NULL AS consent_version";
+  const testConsentVersionSelect = hasConsentVersion ? "p.consent_version" : "NULL AS consent_version";
+  const hasTestMarkers = connection.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='demo_test_participants'").get();
+  if (!hasTestMarkers) throw new Error("Схема демобазы не поддерживает безопасную маркировку тестовых анкет.");
+  const actual = connection.prepare(`SELECT p.id, p.first_name, p.last_name, p.phone, p.city, p.email, p.preferred_contact, p.referral_source,
+      p.registered_at, p.updated_at, p.phone_confirmed_at, p.personal_data_consent, p.consent_at, ${consentVersionSelect}
+      FROM participants p LEFT JOIN demo_test_participants t ON t.participant_id=p.id WHERE t.participant_id IS NULL ORDER BY p.id`).all();
+  const hasWithdrawalTimestamp = connection.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_withdrawn_at");
+  const withdrawnSelect = hasWithdrawalTimestamp ? "p.consent_withdrawn_at" : "NULL AS consent_withdrawn_at";
+  const testParticipants = connection.prepare(`SELECT p.id,p.phone,${testConsentVersionSelect},p.personal_data_consent,p.phone_confirmed_at,p.consent_at,${withdrawnSelect},
+      COUNT(a.id) AS account_count,SUM(CASE WHEN a.platform='telegram' THEN 1 ELSE 0 END) AS telegram_count
+      FROM demo_test_participants t JOIN participants p ON p.id=t.participant_id LEFT JOIN accounts a ON a.participant_id=p.id
+      GROUP BY p.id ORDER BY p.id`).all();
+  if (connection.prepare("SELECT COUNT(*) AS count FROM participants").get().count !== records.length + testParticipants.length) throw new Error("Демонстрационная база изменена: обнаружены неразмеченные дополнительные участники.");
+  if (testParticipants.some((row) => !/^\+7000000\d{4}$/.test(row.phone) || row.consent_version !== "DEMO_TEST_ONLY_V1" || !row.consent_at || (row.personal_data_consent !== 1 && !(row.personal_data_consent === 0 && row.consent_withdrawn_at)) || !row.phone_confirmed_at || row.telegram_count !== 1 || row.account_count !== 1)) {
+    throw new Error("Найдена некорректная или неподтверждённая метка тестовой анкеты.");
+  }
+  if (actual.length !== records.length) throw new Error("Исходные записи генератора изменены. Повторное заполнение остановлено без изменений.");
   const expectedByPhone = new Map(records.map((person) => [person.phone, person]));
   for (const [index, row] of actual.entries()) {
     const expected = expectedByPhone.get(row.phone);
@@ -80,7 +94,8 @@ function assertSeedMatches(database, records, metadata) {
     }
   }
   const accountRows = connection.prepare(`SELECT p.phone, a.participant_id, a.platform, a.messenger_user_id FROM accounts a
-      LEFT JOIN participants p ON p.id=a.participant_id ORDER BY p.phone, a.platform, a.messenger_user_id`).all();
+      JOIN participants p ON p.id=a.participant_id LEFT JOIN demo_test_participants t ON t.participant_id=p.id
+      WHERE t.participant_id IS NULL ORDER BY p.phone, a.platform, a.messenger_user_id`).all();
   const actualKeys = accountRows.map((row) => `${row.phone ?? `ORPHAN-${row.participant_id}`}\u0000${row.platform}\u0000${row.messenger_user_id}`).sort();
   if (JSON.stringify(actualKeys) !== JSON.stringify(expectedAccountKeys(records))) throw new Error("Связанные демонстрационные аккаунты изменились. Проверка остановлена без изменений.");
   if (connection.prepare("SELECT COUNT(*) AS count FROM registration_drafts").get().count !== 0) throw new Error("В демонстрационной базе обнаружены незавершённые анкеты. Проверка остановлена без изменений.");
@@ -184,7 +199,7 @@ function verifyDemoDatabase({ databasePath = defaultDemoPath, productionDatabase
   if (!/^\d+$/.test(String(ownerTelegramId || ""))) throw new Error("OWNER_TELEGRAM_ID не настроен корректно для демонстрационной базы.");
   if (!fs.existsSync(databasePath)) throw new Error("Демонстрационная база отсутствует. Сначала выполните npm.cmd run demo:seed.");
   const inspection = readOnlyInspection(databasePath);
-  if (!inspection.metadata || inspection.metadataCount !== 1 || inspection.metadata.seed_name !== seedName || inspection.metadata.seed_version !== seedVersion || inspection.metadata.participant_count !== 150 || inspection.counts.participants !== 150) {
+  if (!inspection.metadata || inspection.metadataCount !== 1 || inspection.metadata.seed_name !== seedName || inspection.metadata.seed_version !== seedVersion || inspection.metadata.participant_count !== 150) {
     throw new Error("Демонстрационная база не содержит проверенный набор из 150 участников.");
   }
   const expectedRecords = createDemoRecords(inspection.metadata.seeded_at);
@@ -198,3 +213,4 @@ function verifyDemoDatabase({ databasePath = defaultDemoPath, productionDatabase
 }
 
 module.exports = { seedDemoDatabase, verifyDemoDatabase, defaultDemoPath, defaultProductionPath, ensureSafeTarget };
+
