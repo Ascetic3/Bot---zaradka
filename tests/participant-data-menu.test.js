@@ -96,6 +96,21 @@ test("раздел «Мои данные» доступен в личном ча
   } finally { x.close(); }
 });
 
+test("устаревшая кнопка отдельного Zoom-разрешения не меняет данные и удаляет клавиатуру", async () => {
+  const x = setup();
+  try {
+    x.participant("70001", 1);
+    const before = x.sent.length;
+    const actions = await x.callback("mnotify:enable:" + "a".repeat(32));
+    assert.ok(actions.some((entry) => entry.method === "answerCallbackQuery"));
+    assert.ok(actions.some((entry) => entry.method === "editMessageReplyMarkup"));
+    const response = actions.find((entry) => entry.method === "sendMessage");
+    assert.match(response.payload.text, /организационными уведомлениями/i);
+    assert.equal(x.sent.length, before + actions.length);
+    assert.equal(x.database.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='meeting_notification_consents'").get().count, 0);
+  } finally { x.close(); }
+});
+
 test("запрос удаления требует отдельного подтверждения, остаётся на рассмотрении и не удаляет анкету", async () => {
   const x = setup();
   try {

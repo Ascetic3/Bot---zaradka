@@ -1,5 +1,5 @@
 const CORE_TABLES = ["participants", "accounts", "admins", "registration_drafts"];
-const CURRENT_SCHEMA_VERSION = 9;
+const CURRENT_SCHEMA_VERSION = 11;
 
 const BASE_COLUMNS = {
   participants: ["id", "first_name", "last_name", "phone", "city", "email", "preferred_contact", "referral_source", "registered_at", "updated_at", "phone_confirmed_at", "personal_data_consent"],
@@ -141,12 +141,15 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
   if (unsupportedViews) throw new Error("Структура SQLite содержит неизвестные представления; автоматическое обновление остановлено.");
   if (version === 0 && names.length === 0) return { version, structuralVersion: 0, empty: true, legacyUnversioned: false, tables: [] };
   if (!CORE_TABLES.every((table) => names.includes(table))) throw new Error("Структура SQLite не распознана: отсутствуют обязательные таблицы.");
-  const allowedTables = new Set([...CORE_TABLES, "demo_seed_metadata", "consent_withdrawal_requests", "account_link_requests", "participant_deletion_requests", "demo_test_participants"]);
+  const allowedTables = new Set([...CORE_TABLES, "demo_seed_metadata", "consent_withdrawal_requests", "account_link_requests", "participant_deletion_requests", "demo_test_participants", "meetings", "meeting_broadcasts", "meeting_deliveries", "telegram_private_chats", "meeting_send_rate_limit_state"]);
   if (names.some((name) => !allowedTables.has(name))) throw new Error("Структура SQLite содержит неизвестные таблицы; автоматическое обновление остановлено.");
   const explicitIndexes = db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").all();
   const expectedIndexes = new Map([["idx_accounts_participant", "accounts"], ["idx_account_link_requests_participant", "account_link_requests"], ["uq_account_link_requests_target_active", "account_link_requests"], ["idx_participant_deletion_requests_status", "participant_deletion_requests"], ["uq_participant_deletion_requests_active", "participant_deletion_requests"]]);
   if (names.includes("demo_test_participants")) expectedIndexes.set("idx_demo_test_participants_created_at", "demo_test_participants");
-  const expectedIndexCount = 1 + (names.includes("account_link_requests") ? 2 : 0) + (names.includes("participant_deletion_requests") ? 2 : 0) + (names.includes("demo_test_participants") ? 1 : 0);
+  if (names.includes("meeting_broadcasts")) { expectedIndexes.set("idx_meeting_broadcasts_due", "meeting_broadcasts"); expectedIndexes.set("idx_meeting_broadcasts_meeting", "meeting_broadcasts"); }
+  if (names.includes("meeting_deliveries")) { expectedIndexes.set("idx_meeting_deliveries_due", "meeting_deliveries"); expectedIndexes.set("uq_meeting_deliveries_recipient", "meeting_deliveries"); }
+  if (names.includes("telegram_private_chats")) expectedIndexes.set("idx_telegram_private_chats_last_seen", "telegram_private_chats");
+  const expectedIndexCount = 1 + (names.includes("account_link_requests") ? 2 : 0) + (names.includes("participant_deletion_requests") ? 2 : 0) + (names.includes("demo_test_participants") ? 1 : 0) + (names.includes("meeting_broadcasts") ? 2 : 0) + (names.includes("meeting_deliveries") ? 2 : 0) + (names.includes("telegram_private_chats") ? 1 : 0);
   if (explicitIndexes.some((index) => expectedIndexes.get(index.name) !== index.tbl_name) || explicitIndexes.length !== expectedIndexCount) throw new Error("Набор пользовательских индексов SQLite не совпадает с поддерживаемой схемой.");
   const accountParticipantIndex = indexes(db, "accounts").find((index) => index.name === "idx_accounts_participant");
   if (!accountParticipantIndex || accountParticipantIndex.unique || accountParticipantIndex.partial || JSON.stringify(accountParticipantIndex.columns) !== JSON.stringify(["participant_id"])) throw new Error("Индекс accounts.participant_id не совпадает с поддерживаемой схемой.");
@@ -209,6 +212,14 @@ function inspectSchema(db, { allowKnownOptionalColumns = true } = {}) {
   }
   if (names.includes("demo_test_participants")) assertDemoTestParticipantsSchema(db);
   if ((effectiveVersion >= 9) !== names.includes("demo_test_participants")) throw new Error("Таблица меток тестовых демо-анкет не соответствует версии схемы.");
+  const hasMeetingSchema = ["meetings", "meeting_broadcasts", "meeting_deliveries"].every((table) => names.includes(table));
+  const hasAnyMeetingTable = ["meetings", "meeting_broadcasts", "meeting_deliveries"].some((table) => names.includes(table));
+  if ((effectiveVersion >= 10) !== hasMeetingSchema || (hasAnyMeetingTable && !hasMeetingSchema)) throw new Error("Таблицы встреч и рассылок не соответствуют версии схемы.");
+  if (hasMeetingSchema) assertMeetingBroadcastSchema(db);
+  if ((effectiveVersion >= 10) !== names.includes("telegram_private_chats")) throw new Error("Таблица подтверждённых личных чатов не соответствует версии схемы.");
+  if (names.includes("telegram_private_chats")) assertTelegramPrivateChatsSchema(db);
+  if ((effectiveVersion >= 11) !== names.includes("meeting_send_rate_limit_state")) throw new Error("Таблица общего ограничения отправки не соответствует версии схемы.");
+  if (names.includes("meeting_send_rate_limit_state")) assertMeetingSendRateLimitSchema(db);
   const violations = db.prepare("PRAGMA foreign_key_check").all();
   if (violations.length) throw new Error("В SQLite найдены нарушенные связи между таблицами.");
   return { version, structuralVersion, empty: false, legacyUnversioned: version === 0, tables: names };
@@ -223,7 +234,9 @@ const migrationLabels = new Map([
   [6, "Запросы безопасного связывания аккаунтов"],
   [7, "Запросы участников на удаление анкеты"],
   [8, "Повторные запросы удаления после завершения предыдущего"],
-  [9, "Маркировка тестовых анкет деморежима"]
+  [9, "Маркировка тестовых анкет деморежима"],
+  [10, "Планирование Zoom-встреч и история рассылок"],
+  [11, "Общее ограничение скорости Zoom-рассылок"]
 ]);
 
 function assertDemoTestParticipantsSchema(db) {
@@ -300,6 +313,80 @@ function assertWithdrawalSchema(db) {
   if (JSON.stringify(checkExpressions(sql)) !== JSON.stringify(["statusin('pending_review','processed','not_applicable')"])) throw new Error("Допустимые состояния запроса отзыва согласия не совпадают со схемой.");
 }
 
+function assertTelegramPrivateChatsSchema(db) {
+  const table = "telegram_private_chats";
+  const actual = columnMap(db, table);
+  if (actual.size !== 3 || actual.get("telegram_id")?.type !== "TEXT" || !actual.get("telegram_id")?.pk || actual.get("first_seen_at")?.type !== "TEXT" || !actual.get("first_seen_at")?.notnull || actual.get("last_seen_at")?.type !== "TEXT" || !actual.get("last_seen_at")?.notnull) throw new Error("Структура telegram_private_chats не соответствует схеме v10.");
+  const index = indexes(db, table).find((item) => item.name === "idx_telegram_private_chats_last_seen");
+  const sql = normalizeSql(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_telegram_private_chats_last_seen'").get()?.sql);
+  if (!index || index.unique || index.partial || JSON.stringify(index.columns) !== JSON.stringify(["last_seen_at"]) || sql !== "createindexidx_telegram_private_chats_last_seenontelegram_private_chats(last_seen_at)") throw new Error("Индекс последней активности Telegram не соответствует схеме v10.");
+  if (checkExpressions(db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table)?.sql).length) throw new Error("В telegram_private_chats найдены неизвестные ограничения.");
+}
+
+function assertMeetingSendRateLimitSchema(db) {
+  const table = "meeting_send_rate_limit_state";
+  const actual = columnMap(db, table);
+  const expected = { singleton_id: "INTEGER", next_allowed_at: "TEXT", blocked_until: "TEXT",
+    sender_token: "TEXT", sender_pid: "INTEGER", sender_host: "TEXT",
+    sender_delivery_id: "INTEGER", sender_acquired_at: "TEXT" };
+  if (actual.size !== Object.keys(expected).length || !actual.get("singleton_id")?.pk
+      || Object.entries(expected).some(([name, type]) => actual.get(name)?.type !== type || actual.get(name)?.notnull)) {
+    throw new Error("Структура общего ограничения отправки не соответствует схеме v11.");
+  }
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table)?.sql;
+  if (JSON.stringify(checkExpressions(sql)) !== JSON.stringify(["singleton_id=1"])) throw new Error("Ограничение единственной строки общего лимитера не соответствует схеме v11.");
+  if (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count !== 1
+      || !db.prepare(`SELECT 1 FROM ${table} WHERE singleton_id=1`).get()) throw new Error("В общем лимитере должна существовать ровно одна строка состояния.");
+  const owner = db.prepare(`SELECT sender_token,sender_pid,sender_host,sender_delivery_id,sender_acquired_at FROM ${table} WHERE singleton_id=1`).get();
+  if (Boolean(owner.sender_token) !== [owner.sender_pid, owner.sender_host, owner.sender_delivery_id, owner.sender_acquired_at].every((value) => value !== null)) {
+    throw new Error("Состояние владельца отправки в схеме v11 противоречиво.");
+  }
+  if (db.prepare(`PRAGMA foreign_key_list(${table})`).all().length) throw new Error("У общего лимитера не должно быть внешних ключей.");
+}
+
+function assertMeetingBroadcastSchema(db) {
+  const expectedTables = {
+    meetings: { id: "INTEGER", title: "TEXT", starts_at: "TEXT", zoom_url: "TEXT", note: "TEXT", created_by: "TEXT", created_at: "TEXT" },
+    meeting_broadcasts: { id: "INTEGER", meeting_id: "INTEGER", status: "TEXT", scheduled_at: "TEXT", timezone: "TEXT", created_by: "TEXT", created_at: "TEXT", updated_at: "TEXT", next_attempt_at: "TEXT", lease_owner: "TEXT", lease_until: "TEXT", attempt_count: "INTEGER", last_error_code: "TEXT" },
+    meeting_deliveries: { id: "INTEGER", broadcast_id: "INTEGER", participant_id: "INTEGER", platform: "TEXT", messenger_user_id: "TEXT", status: "TEXT", attempt_count: "INTEGER", next_attempt_at: "TEXT", lease_until: "TEXT", last_error_code: "TEXT", sent_at: "TEXT" }
+  };
+  for (const [table, expected] of Object.entries(expectedTables)) {
+    const actual = columnMap(db, table);
+    if (actual.size !== Object.keys(expected).length || Object.entries(expected).some(([name, type]) => !actual.has(name) || String(actual.get(name).type).toUpperCase() !== type)) throw new Error(`Структура ${table} не соответствует схеме v10.`);
+    if (!actual.get("id")?.pk) throw new Error(`В ${table} отсутствует первичный ключ.`);
+  }
+  const notNull = {
+    meetings: ["title", "starts_at", "zoom_url", "created_by", "created_at"],
+    meeting_broadcasts: ["meeting_id", "status", "scheduled_at", "timezone", "created_by", "created_at", "updated_at", "attempt_count"],
+    meeting_deliveries: ["broadcast_id", "platform", "messenger_user_id", "status", "attempt_count"]
+  };
+  for (const [table, names] of Object.entries(notNull)) if (names.some((name) => !columnMap(db, table).get(name)?.notnull)) throw new Error(`Обязательные поля ${table} не соответствуют схеме v10.`);
+  const expectedChecks = {
+    meetings: ["length(trim(title))between1and200"],
+    meeting_broadcasts: ["statusin('draft','scheduled','sending','completed','cancelled','failed')"],
+    meeting_deliveries: ["platformin('telegram','max')", "statusin('pending','sending','sent','temporary_error','unavailable','uncertain')"]
+  };
+  for (const [table, expected] of Object.entries(expectedChecks)) {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table)?.sql;
+    if (JSON.stringify(checkExpressions(sql)) !== JSON.stringify(expected.sort())) throw new Error(`Ограничения состояний ${table} не соответствуют схеме v10.`);
+  }
+  const fk = (table) => db.prepare(`PRAGMA foreign_key_list(${table})`).all();
+  const broadcastFks = fk("meeting_broadcasts");
+  if (!broadcastFks.some((item) => item.table === "meetings" && item.from === "meeting_id" && item.to === "id" && item.on_delete.toUpperCase() === "CASCADE")) throw new Error("Рассылка не связана с встречей каскадным внешним ключом.");
+  const deliveryFks = fk("meeting_deliveries");
+  if (!deliveryFks.some((item) => item.table === "meeting_broadcasts" && item.from === "broadcast_id" && item.to === "id" && item.on_delete.toUpperCase() === "CASCADE") || !deliveryFks.some((item) => item.table === "participants" && item.from === "participant_id" && item.to === "id" && item.on_delete.toUpperCase() === "SET NULL")) throw new Error("Связи истории доставки не соответствуют схеме v10.");
+  const checkIndex = (table, name, columns, unique, sql) => {
+    const row = indexes(db, table).find((item) => item.name === name);
+    const source = normalizeSql(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name)?.sql);
+    if (!row || Boolean(row.unique) !== unique || row.partial || JSON.stringify(row.columns) !== JSON.stringify(columns) || source !== sql) throw new Error(`Индекс ${name} не соответствует схеме v10.`);
+  };
+  checkIndex("meeting_broadcasts", "idx_meeting_broadcasts_due", ["status", "next_attempt_at", "scheduled_at"], false, "createindexidx_meeting_broadcasts_dueonmeeting_broadcasts(status,next_attempt_at,scheduled_at)");
+  checkIndex("meeting_broadcasts", "idx_meeting_broadcasts_meeting", ["meeting_id", "status"], false, "createindexidx_meeting_broadcasts_meetingonmeeting_broadcasts(meeting_id,status)");
+  checkIndex("meeting_deliveries", "idx_meeting_deliveries_due", ["broadcast_id", "status", "next_attempt_at"], false, "createindexidx_meeting_deliveries_dueonmeeting_deliveries(broadcast_id,status,next_attempt_at)");
+  checkIndex("meeting_deliveries", "uq_meeting_deliveries_recipient", ["broadcast_id", "platform", "messenger_user_id"], true, "createuniqueindexuq_meeting_deliveries_recipientonmeeting_deliveries(broadcast_id,platform,messenger_user_id)");
+  const broadcastUnique = indexes(db, "meeting_broadcasts").some((item) => item.unique && JSON.stringify(item.columns) === JSON.stringify(["meeting_id"]));
+  if (!broadcastUnique) throw new Error("Для встречи допускается только одна рассылка.");
+}
 function migrateDatabase(db, { beforeVersionCommit, targetVersion = CURRENT_SCHEMA_VERSION } = {}) {
   if (!Number.isInteger(targetVersion) || targetVersion < 1 || targetVersion > CURRENT_SCHEMA_VERSION) throw new Error("Недопустимая целевая версия миграции.");
   const initial = inspectSchema(db);
@@ -390,6 +477,68 @@ function migrateDatabase(db, { beforeVersionCommit, targetVersion = CURRENT_SCHE
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE INDEX idx_demo_test_participants_created_at ON demo_test_participants(created_at);
+      `);
+      if (target === 10) db.exec(`
+        CREATE TABLE meetings (
+          id INTEGER PRIMARY KEY,
+          title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 200),
+          starts_at TEXT NOT NULL,
+          zoom_url TEXT NOT NULL,
+          note TEXT,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE meeting_broadcasts (
+          id INTEGER PRIMARY KEY,
+          meeting_id INTEGER NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','scheduled','sending','completed','cancelled','failed')),
+          scheduled_at TEXT NOT NULL,
+          timezone TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          next_attempt_at TEXT,
+          lease_owner TEXT,
+          lease_until TEXT,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error_code TEXT
+        );
+        CREATE INDEX idx_meeting_broadcasts_due ON meeting_broadcasts(status,next_attempt_at,scheduled_at);
+        CREATE INDEX idx_meeting_broadcasts_meeting ON meeting_broadcasts(meeting_id,status);
+        CREATE TABLE meeting_deliveries (
+          id INTEGER PRIMARY KEY,
+          broadcast_id INTEGER NOT NULL REFERENCES meeting_broadcasts(id) ON DELETE CASCADE,
+          participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
+          platform TEXT NOT NULL CHECK(platform IN ('telegram','max')),
+          messenger_user_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','temporary_error','unavailable','uncertain')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT,
+          lease_until TEXT,
+          last_error_code TEXT,
+          sent_at TEXT
+        );
+        CREATE INDEX idx_meeting_deliveries_due ON meeting_deliveries(broadcast_id,status,next_attempt_at);
+        CREATE UNIQUE INDEX uq_meeting_deliveries_recipient ON meeting_deliveries(broadcast_id,platform,messenger_user_id);
+        CREATE TABLE telegram_private_chats (
+          telegram_id TEXT PRIMARY KEY,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_telegram_private_chats_last_seen ON telegram_private_chats(last_seen_at);
+      `);
+      if (target === 11) db.exec(`
+        CREATE TABLE meeting_send_rate_limit_state (
+          singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+          next_allowed_at TEXT,
+          blocked_until TEXT,
+          sender_token TEXT,
+          sender_pid INTEGER,
+          sender_host TEXT,
+          sender_delivery_id INTEGER,
+          sender_acquired_at TEXT
+        );
+        INSERT INTO meeting_send_rate_limit_state(singleton_id) VALUES(1);
       `);
       beforeVersionCommit?.(target, db);
       db.pragma(`user_version = ${target}`);

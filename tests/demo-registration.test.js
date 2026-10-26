@@ -235,6 +235,13 @@ test("тестовая анкета поддерживает личный зап
     assert.ok(prompt.reply_markup.inline_keyboard[0][0].callback_data.startsWith("pdata:delete:confirm:"));
     await x.click(prompt.reply_markup.inline_keyboard[0][0].callback_data);
     const id = x.db.findParticipantByTelegramIdIncludingWithdrawn(ownerId).id;
+    x.db.recordTelegramPrivateChat(String(ownerId));
+    const meetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Тестовая встреча','2031-01-01T10:00:00.000Z','https://zoom.us/j/123',?)`).run(String(ownerId)).lastInsertRowid);
+    const broadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by)
+      VALUES(?,'completed','2030-12-31T10:00:00.000Z','Etc/UTC',?)`).run(meetingId, String(ownerId)).lastInsertRowid);
+    const deliveryId = Number(x.db.db.prepare(`INSERT INTO meeting_deliveries(broadcast_id,participant_id,platform,messenger_user_id,status,attempt_count,last_error_code)
+      VALUES(?,?,'telegram',?,'uncertain',1,'DELIVERY_RESULT_REQUIRES_REVIEW')`).run(broadcastId, id, String(ownerId)).lastInsertRowid);
     assert.equal(x.db.listDemoTestDeletionRequests().length, 1);
     await x.send("/admin");
     await x.send("📋 Запросы участников");
@@ -247,11 +254,67 @@ test("тестовая анкета поддерживает личный зап
     assert.match(result.text, /удалены из demo\.sqlite/i);
     assert.equal(x.db.getParticipantIncludingWithdrawn(id), undefined);
     assert.equal(x.db.findParticipantByPhone("+70000001234"), undefined);
+    assert.equal(x.db.hasTelegramPrivateChat(String(ownerId)), false);
+    const anonymizedDelivery = x.db.db.prepare("SELECT participant_id,messenger_user_id,status,last_error_code FROM meeting_deliveries WHERE broadcast_id=?").get(broadcastId);
+    assert.deepEqual(anonymizedDelivery, { participant_id: null, messenger_user_id: `deleted-delivery-${deliveryId}`, status: "uncertain", last_error_code: "DELIVERY_RESULT_REQUIRES_REVIEW" });
     assert.equal(x.db.db.prepare("SELECT COUNT(*) AS n FROM participants").get().n, 150);
     const dataService = require("../src/participant-data").createParticipantDataService({ db: x.db, projectRoot: x.root });
     assert.throws(() => dataService.prepareAdminDeletion(userId, 1), /административных прав/i);
     await fillToConfirm(x, ownerId, "+70000001234");
     assert.match((await x.send("✅ Подтвердить тестовую регистрацию")).text, /только в demo\.sqlite/);
+  } finally { x.close(); }
+});
+
+
+test("демобаза запускается после перезапуска с допустимым черновиком редактирования тестовой анкеты", async () => {
+  const x = setup();
+  try {
+    await fillToConfirm(x);
+    await x.send("✅ Подтвердить тестовую регистрацию");
+    await x.send("✏️ Изменить данные");
+    await x.send("Город");
+    const draft = x.db.getDraft("telegram", ownerId);
+    assert.equal(draft.current_step, "profile_edit:city");
+    assert.equal(draft.answers.edit_field, "city");
+    assert.equal(draft.answers.participant_id, draft.answers.snapshot.id);
+    assert.equal(draft.answers.snapshot.city, null);
+
+    x.db.closeDatabase();
+    for (const name of modules) delete require.cache[require.resolve(name)];
+    const reopened = require("../src/database");
+    const { verifyDemoDatabase } = require("../src/demo/seed");
+    const verification = verifyDemoDatabase({ databasePath: x.demoPath, productionDatabasePath: x.productionPath, ownerTelegramId: ownerId });
+    assert.equal(verification.count, 151);
+    assert.equal(reopened.getDraft("telegram", ownerId).current_step, "profile_edit:city");
+    assert.deepEqual(reopened.getDraft("telegram", ownerId).answers, draft.answers);
+    assert.equal(reopened.isDemoTestParticipantForTelegram(ownerId), true);
+    reopened.closeDatabase();
+  } finally {
+    try { x.close(); } catch {}
+  }
+});
+
+test("проверка демобазы отклоняет произвольные, повреждённые и не принадлежащие тестовому аккаунту черновики", async () => {
+  const x = setup();
+  try {
+    await fillToConfirm(x);
+    await x.send("✅ Подтвердить тестовую регистрацию");
+    const { verifyDemoDatabase } = require("../src/demo/seed");
+    const verify = () => verifyDemoDatabase({ databasePath: x.demoPath, productionDatabasePath: x.productionPath, ownerTelegramId: ownerId });
+    x.db.saveDraft("telegram", ownerId, "city", {});
+    assert.throws(verify, /недопустимый.*черновик/i);
+    x.db.deleteDraft("telegram", ownerId);
+
+    x.db.saveDraft("telegram", ownerId, "profile_edit:city", { email: "unexpected@example.invalid" });
+    assert.throws(verify, /некорректный.*снимок/i);
+    x.db.deleteDraft("telegram", ownerId);
+
+    x.db.saveDraft("telegram", 99999123, "profile_edit:city", {});
+    assert.throws(verify, /не связан.*тестовой анкетой/i);
+    x.db.deleteDraft("telegram", 99999123);
+
+    x.db.db.prepare("INSERT INTO registration_drafts(platform,messenger_user_id,current_step,answers_json) VALUES('telegram',?,?,?)").run(String(ownerId), "profile_edit:city", "not-json");
+    assert.throws(verify, /повреждённый черновик/i);
   } finally { x.close(); }
 });
 

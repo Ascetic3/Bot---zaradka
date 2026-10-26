@@ -53,6 +53,7 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
       "Для регистрации в клубе „Магия утра“ нам потребуются ваши имя, фамилия, номер телефона и дополнительные сведения, которые вы решите указать.\n\n" +
       "Также Telegram ID используется, чтобы связать анкету с вашим аккаунтом и показывать её только вам.\n\n" +
       "Пожалуйста, ознакомьтесь с <a href=\"" + escapeHtml(answers.policy_url) + "\">Политикой обработки персональных данных</a>.\n\n" +
+      "Мы также отправляем зарегистрированным участникам организационные приглашения на Zoom-встречи клуба в Telegram, если участник ранее открыл личный чат с ботом. Предпочтительный способ связи не влияет на получение этих уведомлений. Это не рекламная рассылка.\n\n" +
       "Нажимая «Принимаю», вы даёте согласие на обработку указанных данных для регистрации и связи по вопросам деятельности клуба.\n\n" +
       "Вы можете отозвать согласие в разделе «🔐 Мои данные».";
     const keyboard = new InlineKeyboard()
@@ -129,7 +130,7 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
     }
     const [, action, nonce] = ctx.match;
     const draft = db.getDraft("telegram", uid);
-    if (!draft || draft.current_step !== "consent" || draft.answers.consent_nonce !== nonce) {
+    if (!draft || draft.invalidAnswers || draft.current_step !== "consent" || draft.answers.consent_nonce !== nonce) {
       return ctx.answerCallbackQuery({ text: "Кнопка устарела или уже обработана." });
     }
     if (action === "d") return refuseConsent(ctx, uid);
@@ -143,6 +144,10 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
     const policy = getRegistrationPolicy();
     if (!policy) return ctx.reply("Регистрация временно недоступна: администратору нужно заполнить, утвердить и опубликовать политику, затем настроить PRIVACY_POLICY_URL, PRIVACY_POLICY_VERSION и PRIVACY_POLICY_PUBLISHED=true.");
     const draft = db.getDraft("telegram", ctx.from.id);
+    if (draft?.invalidAnswers) {
+      db.deleteDraft("telegram", ctx.from.id);
+      return ctx.reply("Черновик повреждён и сброшен. Начните регистрацию заново.");
+    }
     if (!draft) {
       const answers = createConsentDraftAnswers({}, policy);
       db.saveDraft("telegram", ctx.from.id, "consent", answers);
@@ -182,6 +187,10 @@ function registerRegistration(bot, { rateLimiter = createRateLimiter() } = {}) {
     // завершает редактирование профиля, но сохраняет черновик регистрации.
     if (text === "🏠 Главное меню") return next();
     if (draft.current_step.startsWith("profile_edit")) return next();
+    if (draft.invalidAnswers) {
+      db.deleteDraft("telegram", uid);
+      return ctx.reply("Черновик регистрации повреждён и сброшен. Начните заполнение заново.");
+    }
     let step = draft.current_step; const a = draft.answers; const input = ctx.message.text?.trim();
     if (input === "❌ Отменить регистрацию" || input === "❌ Отмена") {
       if (String(process.env.DEMO_MODE).toLowerCase() === "true") return ctx.reply("Настоящая регистрация отключена в демонстрационном режиме. Черновик не изменён.");

@@ -3,6 +3,7 @@ const db = require("./database");
 const { isPrivateChat } = require("./chat-guards");
 const { createParticipantsWorkbook, getExportFilename } = require("./excel-export");
 const { createRateLimiter, allowRequest } = require("./request-limits");
+const { clearMeetingBroadcastState } = require("./meeting-broadcasts");
 const { ExpiringMap } = require("./expiring-map");
 const pending = new ExpiringMap(30 * 60_000);
 const participantViews = new ExpiringMap(30 * 60_000);
@@ -13,8 +14,8 @@ const exportPrompts = new ExpiringMap(24 * 60 * 60_000);
 const demoDeletionReviews = new ExpiringMap(10 * 60_000);
 const usernameMiddlewareRegistered = new WeakSet();
 const demoBanner = () => process.env.DEMO_MODE === "true" ? "🧪 Демонстрационный режим. Данные вымышленные\n\n" : "";
-const ownerMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("📋 Запросы участников").row().text("⚙️ Управление администраторами").row().text("🏠 Главное меню").resized();
-const adminMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("📋 Запросы участников").row().text("🏠 Главное меню").resized();
+const ownerMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("📋 Запросы участников").row().text("📅 Встречи и рассылки").row().text("⚙️ Управление администраторами").row().text("🏠 Главное меню").resized();
+const adminMenu = new Keyboard().text("🔎 Найти участника").row().text("👥 Все участники").row().text("📊 Статистика").row().text("📥 Скачать Excel").row().text("📋 Запросы участников").row().text("📅 Встречи и рассылки").row().text("🏠 Главное меню").resized();
 const managementMenu = new Keyboard().text("📋 Список администраторов").row().text("➕ Добавить администратора").row().text("➖ Удалить администратора").row().text("⬅️ В меню администратора").resized();
 const privateChat = isPrivateChat;
 const role = (ctx) => privateChat(ctx) ? db.getAdminRole(ctx.from.id) : null;
@@ -27,6 +28,7 @@ const showAdminMenu = (ctx) => {
   return replyAdminMenu(ctx);
 };
 const clearAdminFlow = (id) => {
+  clearMeetingBroadcastState(id);
   participantViews.delete(id);
   pending.delete(id);
   exportConfirmations.delete(id);
@@ -79,6 +81,12 @@ function registerAdmin(bot, { rateLimiter = createRateLimiter(), demoProjectRoot
     const currentRole = role(ctx);
     if (!currentRole) return ctx.reply("У вас нет доступа к административному меню.");
     return showAdminMenu(ctx);
+  });
+  bot.hears("📅 Встречи и рассылки", async (ctx, next) => {
+    if (!privateChat(ctx)) return ctx.reply("Административные функции доступны только в личном чате с ботом.");
+    if (!role(ctx)) return ctx.reply("У вас нет доступа к административным функциям.");
+    clearAdminFlow(String(ctx.from.id));
+    return next();
   });
   bot.hears("🔎 Найти участника", async (ctx) => {
     if (!privateChat(ctx)) return ctx.reply("Поиск доступен только в личном чате с ботом.");
@@ -430,5 +438,5 @@ function registerAdmin(bot, { rateLimiter = createRateLimiter(), demoProjectRoot
     demoDeletionReviews.stop();
   };
 }
-module.exports = { registerAdmin, registerAdminUsernameRefresh };
+module.exports = { registerAdmin, registerAdminUsernameRefresh, showAdminMenu };
 

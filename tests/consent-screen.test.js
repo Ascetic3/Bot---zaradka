@@ -59,6 +59,9 @@ test("экран согласия показывает кликабельную 
   const x = setup(); try {
     const sent = await x.startRegistration();
     assert.match(sent.text, /Согласие на обработку персональных данных/);
+    assert.match(sent.text, /организационные приглашения на Zoom-встречи клуба в Telegram/i);
+    assert.match(sent.text, /Предпочтительный способ связи не влияет/i);
+    assert.match(sent.text, /Это не рекламная рассылка/i);
     assert.equal(sent.parse_mode, "HTML");
     assert.match(sent.text, /<a href="https:\/\/club\.example\.org\/privacy\?lang=ru&amp;revision=1">Политикой обработки персональных данных<\/a>/);
     assert.doesNotMatch(sent.text.replace(/<a href="[^"]+">/g, "<a>").replace(/<[^>]*>/g, ""), /https?:\/\//);

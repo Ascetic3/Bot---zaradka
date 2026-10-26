@@ -10,6 +10,7 @@
     "db:restore": "node src/database/restore-cli.js",
     "test": "node --test",
     "db:migrate": "node src/database/migrate-cli.js",
+    "meeting:recover-sender": "node src/database/recover-meeting-sender-cli.js",
     "demo:seed": "node src/demo/seed-cli.js",
     "demo:start": "node src/demo/start.js"
   },

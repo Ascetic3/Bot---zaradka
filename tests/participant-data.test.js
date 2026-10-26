@@ -141,6 +141,190 @@ test("сбой удаления участника откатывает удал
   } finally { x.close(); }
 });
 
+test("удаление анкеты обезличивает историю доставок и удаляет больше не нужный личный чат", () => {
+  const x = setup();
+  try {
+    const removed = x.createParticipant("700000031", 31);
+    const other = x.createParticipant("700000032", 32);
+    x.db.linkAccount(removed.id, "max", "synthetic-max-700000031");
+    x.db.recordTelegramPrivateChat("700000031", FIXED_NOW.toISOString());
+    const meetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Тестовая встреча','2026-10-21T10:00:00.000Z','https://zoom.us/j/123','700000003')`).run().lastInsertRowid);
+    const broadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by)
+      VALUES(?,'completed','2026-10-20T09:00:00.000Z','Etc/UTC','700000003')`).run(meetingId).lastInsertRowid);
+    const uncertainMeetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Другая тестовая встреча','2026-10-21T11:00:00.000Z','https://zoom.us/j/124','700000003')`).run().lastInsertRowid);
+    const uncertainBroadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by)
+      VALUES(?,'failed','2026-10-20T09:00:00.000Z','Etc/UTC','700000003')`).run(uncertainMeetingId).lastInsertRowid);
+    const delivery = x.db.db.prepare(`INSERT INTO meeting_deliveries(broadcast_id,participant_id,platform,messenger_user_id,status,attempt_count,sent_at)
+      VALUES(?,?,? ,?,'sent',1,?)`);
+    const sentId = Number(delivery.run(broadcastId, removed.id, "telegram", "700000031", FIXED_NOW.toISOString()).lastInsertRowid);
+    const maxId = Number(delivery.run(broadcastId, removed.id, "max", "synthetic-max-700000031", FIXED_NOW.toISOString()).lastInsertRowid);
+    const uncertainId = Number(x.db.db.prepare(`INSERT INTO meeting_deliveries(broadcast_id,participant_id,platform,messenger_user_id,status,attempt_count,last_error_code)
+      VALUES(?,?, 'telegram',?,'uncertain',1,'DELIVERY_RESULT_REQUIRES_REVIEW')`).run(uncertainBroadcastId, removed.id, "700000031").lastInsertRowid);
+    const otherId = Number(delivery.run(broadcastId, other.id, "telegram", "700000032", FIXED_NOW.toISOString()).lastInsertRowid);
+
+    const result = x.db.deleteParticipantById(removed.id);
+    assert.equal(result.delivery_identifiers_anonymized, 3);
+    assert.equal(x.db.hasTelegramPrivateChat("700000031"), false);
+    assert.equal(x.db.hasTelegramPrivateChat("700000032"), false, "чужой личный чат не удаляется и не должен был существовать");
+    const rows = x.db.db.prepare("SELECT id,participant_id,platform,messenger_user_id,status,attempt_count,sent_at,last_error_code FROM meeting_deliveries ORDER BY id").all();
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    for (const id of [sentId, maxId, uncertainId]) {
+      assert.equal(byId.get(id).participant_id, null);
+      assert.equal(byId.get(id).messenger_user_id, `deleted-delivery-${id}`);
+    }
+    assert.equal(byId.get(sentId).status, "sent");
+    assert.equal(byId.get(sentId).sent_at, FIXED_NOW.toISOString());
+    assert.equal(byId.get(maxId).status, "sent");
+    assert.equal(byId.get(uncertainId).status, "uncertain");
+    assert.equal(byId.get(uncertainId).last_error_code, "DELIVERY_RESULT_REQUIRES_REVIEW");
+    assert.equal(byId.get(otherId).participant_id, other.id);
+    assert.equal(byId.get(otherId).messenger_user_id, "700000032");
+    assert.deepEqual(x.db.db.prepare("SELECT status,COUNT(*) AS n FROM meeting_deliveries WHERE broadcast_id=? GROUP BY status ORDER BY status").all(broadcastId), [
+      { status: "sent", n: 3 }
+    ]);
+    assert.deepEqual(x.db.db.prepare("SELECT status,COUNT(*) AS n FROM meeting_deliveries WHERE broadcast_id=? GROUP BY status ORDER BY status").all(uncertainBroadcastId), [
+      { status: "uncertain", n: 1 }
+    ]);
+    const repeated = x.db.deleteParticipantById(removed.id);
+    assert.equal(repeated.deleted, false);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS n FROM meeting_deliveries WHERE messenger_user_id='700000031'").get().n, 0);
+
+    // Deleting an administrator's participant record also removes the chat
+    // confirmation; the independent administrator role itself is untouched.
+    const otherDeletionTarget = x.createParticipant("700000033", 33);
+    x.db.db.prepare("INSERT INTO admins(telegram_id,role) VALUES('700000033','admin')").run();
+    x.db.recordTelegramPrivateChat("700000033", FIXED_NOW.toISOString());
+    x.db.deleteParticipantById(otherDeletionTarget.id);
+    assert.equal(x.db.hasTelegramPrivateChat("700000033"), false);
+    assert.equal(x.db.getAdminRole("700000033"), "admin", "удаление анкеты не снимает отдельную роль администратора");
+  } finally { x.close(); }
+});
+
+test("удаление продолжает работать со схемой до Zoom-таблиц, без изменения миграций", () => {
+  const x = setup();
+  try {
+    const participant = x.createParticipant("700000039", 39);
+    x.db.db.exec("DROP TABLE meeting_deliveries; DROP TABLE meeting_broadcasts; DROP TABLE meetings; DROP TABLE telegram_private_chats;");
+    const result = x.db.deleteParticipantById(participant.id);
+    assert.equal(result.deleted, true);
+    assert.equal(result.delivery_identifiers_anonymized, 0);
+    assert.equal(x.db.getParticipant(participant.id), undefined);
+  } finally { x.close(); }
+});
+
+test("ошибка удаления откатывает обезличивание доставок и очистку личного чата", () => {
+  const x = setup();
+  try {
+    const participant = x.createParticipant("700000034", 34);
+    x.db.recordTelegramPrivateChat("700000034", FIXED_NOW.toISOString());
+    const meetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Тестовая встреча','2026-10-21T10:00:00.000Z','https://zoom.us/j/123','700000003')`).run().lastInsertRowid);
+    const broadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by)
+      VALUES(?,'sending','2026-10-20T09:00:00.000Z','Etc/UTC','700000003')`).run(meetingId).lastInsertRowid);
+    const deliveryId = Number(x.db.db.prepare(`INSERT INTO meeting_deliveries(broadcast_id,participant_id,platform,messenger_user_id,status)
+      VALUES(?,?,'telegram','700000034','pending')`).run(broadcastId, participant.id).lastInsertRowid);
+    x.db.db.exec("CREATE TRIGGER reject_test_participant_delete BEFORE DELETE ON participants BEGIN SELECT RAISE(ABORT, 'synthetic delete failure'); END");
+    assert.throws(() => x.db.deleteParticipantById(participant.id), /synthetic delete failure/);
+    const delivery = x.db.db.prepare("SELECT participant_id,messenger_user_id,status FROM meeting_deliveries WHERE id=?").get(deliveryId);
+    assert.deepEqual(delivery, { participant_id: participant.id, messenger_user_id: "700000034", status: "pending" });
+    assert.equal(x.db.hasTelegramPrivateChat("700000034"), true);
+    assert.ok(x.db.getParticipant(participant.id));
+  } finally { x.close(); }
+});
+
+test("удаление во время активной рассылки сохраняет текущий исход, но не запускает новую отправку удалённому участнику", async () => {
+  const x = setup();
+  try {
+    const removed = x.createParticipant("700000035", 35);
+    const remaining = x.createParticipant("700000036", 36);
+    x.db.recordTelegramPrivateChat("700000035", FIXED_NOW.toISOString());
+    x.db.recordTelegramPrivateChat("700000036", FIXED_NOW.toISOString());
+    const { createMeetingBroadcastStore } = require("../src/meeting-broadcast-store");
+    const { createMeetingBroadcastScheduler } = require("../src/meeting-broadcast-service");
+    const store = createMeetingBroadcastStore(x.db.db);
+    const now = new Date();
+    const meetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Тестовая встреча',?,'https://zoom.us/j/123','700000003')`).run(new Date(now.getTime() + 3_600_000).toISOString()).lastInsertRowid);
+    const broadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by,updated_at,next_attempt_at)
+      VALUES(?,'scheduled',?,'Etc/UTC','700000003',?,?)`).run(meetingId, new Date(now.getTime() - 1_000).toISOString(), now.toISOString(), new Date(now.getTime() - 1_000).toISOString()).lastInsertRowid);
+    let enterApi;
+    const apiEntered = new Promise((resolve) => { enterApi = resolve; });
+    let resolveApi;
+    const apiGate = new Promise((resolve) => { resolveApi = resolve; });
+    const sent = [];
+    const scheduler = createMeetingBroadcastScheduler({
+      store,
+      adapters: { telegram: { async sendMessage(id) { sent.push(String(id)); if (String(id) === "700000035") { enterApi(); await apiGate; } } } },
+      getAdminRole: () => "owner", now: () => new Date(), sleep: async () => {}, workerId: "delete-during-send"
+    });
+    const running = scheduler.tick();
+    await apiEntered;
+    const deletion = x.db.deleteParticipantById(removed.id);
+    assert.equal(deletion.deleted, true);
+    resolveApi();
+    const outcomes = await running;
+    assert.deepEqual(sent, ["700000035", "700000036"]);
+    assert.deepEqual(outcomes.map((item) => item.status), ["sent", "sent"]);
+    const rows = x.db.db.prepare("SELECT participant_id,messenger_user_id,status FROM meeting_deliveries WHERE broadcast_id=? ORDER BY id").all(broadcastId);
+    assert.deepEqual(rows, [
+      { participant_id: null, messenger_user_id: `deleted-delivery-${x.db.db.prepare("SELECT id FROM meeting_deliveries WHERE broadcast_id=? ORDER BY id LIMIT 1").get(broadcastId).id}`, status: "sent" },
+      { participant_id: remaining.id, messenger_user_id: "700000036", status: "sent" }
+    ]);
+    assert.equal(store.summary(broadcastId).deliveries.sent, 2);
+    assert.equal(x.db.db.prepare("SELECT COUNT(*) AS n FROM meeting_deliveries WHERE broadcast_id=? AND messenger_user_id='700000035'").get(broadcastId).n, 0);
+
+    // Closing and reopening the file cannot reconstruct the removed ID or make
+    // the anonymized delivery eligible again.
+    x.db.closeDatabase();
+    const reopened = new Database(x.db.dbPath);
+    reopened.pragma("foreign_keys=ON");
+    const persisted = reopened.prepare("SELECT id,participant_id,messenger_user_id,status FROM meeting_deliveries WHERE broadcast_id=? ORDER BY id LIMIT 1").get(broadcastId);
+    assert.equal(persisted.participant_id, null);
+    assert.match(persisted.messenger_user_id, /^deleted-delivery-\d+$/);
+    assert.equal(persisted.status, "sent");
+    reopened.close();
+  } finally { x.close(); }
+});
+
+test("неопределённый результат API после удаления анкеты остаётся uncertain без возврата Telegram ID", async () => {
+  const x = setup();
+  try {
+    const participant = x.createParticipant("700000038", 38);
+    x.db.recordTelegramPrivateChat("700000038", FIXED_NOW.toISOString());
+    const { createMeetingBroadcastStore } = require("../src/meeting-broadcast-store");
+    const { createMeetingBroadcastScheduler } = require("../src/meeting-broadcast-service");
+    const store = createMeetingBroadcastStore(x.db.db);
+    const now = new Date();
+    const meetingId = Number(x.db.db.prepare(`INSERT INTO meetings(title,starts_at,zoom_url,created_by)
+      VALUES('Тестовая встреча',?,'https://zoom.us/j/123','700000003')`).run(new Date(now.getTime() + 3_600_000).toISOString()).lastInsertRowid);
+    const broadcastId = Number(x.db.db.prepare(`INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by,updated_at,next_attempt_at)
+      VALUES(?,'scheduled',?,'Etc/UTC','700000003',?,?)`).run(meetingId, new Date(now.getTime() - 1_000).toISOString(), now.toISOString(), new Date(now.getTime() - 1_000).toISOString()).lastInsertRowid);
+    let enterApi;
+    const apiEntered = new Promise((resolve) => { enterApi = resolve; });
+    let rejectApi;
+    const apiGate = new Promise((_resolve, reject) => { rejectApi = reject; });
+    const scheduler = createMeetingBroadcastScheduler({
+      store,
+      adapters: { telegram: { async sendMessage() { enterApi(); await apiGate; } } },
+      getAdminRole: () => "owner", now: () => new Date(), sleep: async () => {}, workerId: "delete-with-uncertain-result"
+    });
+    const running = scheduler.tick();
+    await apiEntered;
+    x.db.deleteParticipantById(participant.id);
+    rejectApi(new Error("simulated timeout"));
+    await running;
+    const row = x.db.db.prepare("SELECT participant_id,messenger_user_id,status,last_error_code FROM meeting_deliveries WHERE broadcast_id=?").get(broadcastId);
+    assert.equal(row.participant_id, null);
+    assert.match(row.messenger_user_id, /^deleted-delivery-\d+$/);
+    assert.equal(row.status, "uncertain");
+    assert.equal(row.last_error_code, "DELIVERY_RESULT_REQUIRES_REVIEW");
+    assert.equal(x.db.hasTelegramPrivateChat("700000038"), false);
+    assert.equal(store.summary(broadcastId).deliveries.uncertain, 1);
+  } finally { x.close(); }
+});
+
 test("повторный запрос удаления разрешён после processed и not_applicable, но не при активном запросе", () => {
   const x = setup();
   try {

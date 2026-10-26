@@ -9,7 +9,7 @@ const { createRateLimiter } = require("../src/request-limits");
 const isolatedModules = [
   "../src/database", "../src/bot-handlers", "../src/admin", "../src/main-menu",
   "../src/myid", "../src/registration-preview", "../src/registration",
-  "../src/profile", "../src/participant-service", "../src/chat-guards", "../src/account-links", "../src/participant-data", "../src/participant-data-menu"
+  "../src/profile", "../src/participant-service", "../src/chat-guards", "../src/account-links", "../src/participant-data", "../src/participant-data-menu", "../src/meeting-broadcasts", "../src/meeting-broadcast-store", "../src/meeting-broadcast-service", "../src/private-chat-tracker"
 ];
 
 function setup() {

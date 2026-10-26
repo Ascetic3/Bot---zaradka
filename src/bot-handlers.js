@@ -8,13 +8,17 @@ const { registerPrivateCallbackGuard } = require("./chat-guards");
 const { registerStart } = require("./main-menu");
 const { registerAccountLinks } = require("./account-links");
 const { registerParticipantDataMenu } = require("./participant-data-menu");
+const { registerPrivateChatTracker } = require("./private-chat-tracker");
+const { registerMeetingBroadcasts } = require("./meeting-broadcasts");
 
 // Keep one canonical registration order for production and integration tests.
 function registerBotHandlers(bot, { rateLimiter, demoRegistrationService, participantDataService, demoProjectRoot } = {}) {
   const cleanups = [];
   registerAdminUsernameRefresh(bot);
   registerPrivateCallbackGuard(bot);
+  registerPrivateChatTracker(bot);
   cleanups.push(registerAdmin(bot, { rateLimiter, demoProjectRoot }));
+  cleanups.push(registerMeetingBroadcasts(bot));
   // Test registration and preview own independent in-memory sessions.
   // Register the test flow first so /preview_registration can release its
   // session before the preview flow handles the command.

@@ -35,6 +35,16 @@ function registerParticipantDataMenu(bot, { db = database, service = createParti
     try { await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }); } catch {}
   };
 
+  // Old Telegram messages can still contain buttons from the removed opt-in
+  // screen. Acknowledge them and remove the obsolete keyboard without writing
+  // any preference to the database.
+  bot.callbackQuery(/^mnotify:(?:enable|revoke):[a-f0-9]{32}$/, async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Отдельная настройка приглашений больше не используется." });
+    await removeInlineKeyboard(ctx);
+    if (!privateOnly(ctx)) return;
+    return ctx.reply("Zoom-приглашения являются организационными уведомлениями для участников, которые соответствуют условиям получения.");
+  });
+
   bot.hears("🔐 Мои данные", async (ctx) => {
     if (!privateOnly(ctx)) return ctx.reply("🔒 Управление персональными данными доступно только в личном чате с ботом.");
     if (!(await allowRequest(ctx, rateLimiter, "participant_data"))) return;

@@ -4,6 +4,7 @@ const Database = require("better-sqlite3");
 const { getDatabasePath } = require("./config");
 const { normalizeDatabasePath } = require("./config");
 const { initializeEmptyDatabase, CURRENT_SCHEMA_VERSION } = require("./migrations");
+const { createProfileEditSnapshot } = require("../profile-edit-snapshot");
 
 const dbPath = getDatabasePath();
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -109,6 +110,29 @@ function listParticipants(limit = 10, offset = 0) {
   const safeOffset = Math.max(0, Number.parseInt(offset, 10) || 0);
   return db.prepare("SELECT id, first_name, last_name, city, registered_at FROM participants WHERE consent_withdrawn_at IS NULL ORDER BY registered_at DESC,id DESC LIMIT ? OFFSET ?").all(safeLimit, safeOffset);
 }
+function updateParticipantIfUnchanged(id, telegramId, expected, changes, validateCandidate) {
+  const allowed = new Set(["first_name", "last_name", "city", "email", "preferred_contact", "referral_source"]);
+  const entries = Object.entries(changes || {}).filter(([key]) => allowed.has(key));
+  if (entries.length !== 1 || typeof validateCandidate !== "function") throw new Error("Некорректное изменение анкеты.");
+  return db.transaction(() => {
+    const current = db.prepare(`SELECT p.* FROM participants p
+      JOIN accounts a ON a.participant_id=p.id AND a.platform='telegram'
+      WHERE p.id=? AND a.messenger_user_id=?`).get(Number(id), String(telegramId));
+    if (!current) return { status: "not_found" };
+    if (current.personal_data_consent !== 1 || !current.consent_at || !current.consent_version || current.consent_withdrawn_at) return { status: "consent_withdrawn" };
+    const snapshotFields = ["id", "first_name", "last_name", "phone", "city", "email", "preferred_contact", "referral_source", "registered_at", "updated_at", "phone_confirmed_at", "personal_data_consent", "consent_at", "consent_version", "consent_withdrawn_at"];
+    if (!expected || snapshotFields.some((field) => (expected[field] ?? null) !== (current[field] ?? null))) return { status: "conflict", participant: current };
+    const [field, rawValue] = entries[0];
+    const validated = validateCandidate(current, field, rawValue);
+    if (!validated || !Object.hasOwn(validated, field)) throw new Error("Проверка изменения не вернула значение поля.");
+    const update = db.prepare(`UPDATE participants SET ${field}=@value, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id=@id AND personal_data_consent=1 AND consent_at IS NOT NULL AND trim(consent_at)<>'' AND consent_version IS NOT NULL AND trim(consent_version)<>'' AND consent_withdrawn_at IS NULL AND EXISTS (
+        SELECT 1 FROM accounts WHERE participant_id=@id AND platform='telegram' AND messenger_user_id=@telegramId
+      )`).run({ value: validated[field], id: Number(id), telegramId: String(telegramId) });
+    if (update.changes !== 1) return { status: "not_found" };
+    return { status: "updated", participant: getParticipant(id) };
+  }).immediate();
+}
 function updateParticipant(id, fields) {
   const allowed = new Set(["first_name","last_name","phone","city","email","preferred_contact","referral_source","phone_confirmed_at","personal_data_consent"]);
   const entries = Object.entries(fields).filter(([key]) => allowed.has(key));
@@ -117,8 +141,16 @@ function updateParticipant(id, fields) {
   const values = Object.fromEntries(entries);
   if (values.phone !== undefined) values.phone = normalizePhone(values.phone);
   if (values.personal_data_consent !== undefined) values.personal_data_consent = values.personal_data_consent ? 1 : 0;
-  db.prepare(`UPDATE participants SET ${assignments}, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=@id AND consent_withdrawn_at IS NULL`).run({ ...values, id });
-  return getParticipant(id);
+  return db.transaction(() => {
+    const current = db.prepare("SELECT * FROM participants WHERE id=? AND consent_withdrawn_at IS NULL").get(Number(id));
+    if (!current) return undefined;
+    const candidate = { ...current, ...values };
+    if (candidate.preferred_contact === "Электронная почта" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(candidate.email ?? ""))) {
+      throw new Error("Для связи по электронной почте необходимо сохранить корректный email.");
+    }
+    db.prepare(`UPDATE participants SET ${assignments}, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=@id AND consent_withdrawn_at IS NULL`).run({ ...values, id });
+    return undefined;
+  }).immediate();
 }
 // Internal verified-contact contract for a future phone-change flow. The caller
 // must pass a contact object received from Telegram; plain text is never enough.
@@ -314,7 +346,33 @@ function completeAccountLinkRequest({ requestId, platform, messengerUserId, veri
   }).immediate();
 }
 function saveDraft(platform, userId, step, answers) { db.prepare(`INSERT INTO registration_drafts(platform,messenger_user_id,current_step,answers_json,updated_at) VALUES(?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(platform,messenger_user_id) DO UPDATE SET current_step=excluded.current_step,answers_json=excluded.answers_json,updated_at=excluded.updated_at`).run(platform,String(userId),step,JSON.stringify(answers)); }
-function getDraft(platform, userId) { const row=db.prepare("SELECT * FROM registration_drafts WHERE platform=? AND messenger_user_id=?").get(platform,String(userId)); return row ? {...row, answers: JSON.parse(row.answers_json)} : undefined; }
+function getDraft(platform, userId) {
+  const row = db.prepare("SELECT * FROM registration_drafts WHERE platform=? AND messenger_user_id=?").get(platform, String(userId));
+  if (!row) return undefined;
+  try { return { ...row, answers: JSON.parse(row.answers_json) }; }
+  catch { return { ...row, answers: null, invalidAnswers: true }; }
+}
+function beginProfileEditDraft(telegramId, field) {
+  const actor = String(telegramId ?? "");
+  const allowed = new Set(["first_name", "last_name", "city", "email", "preferred_contact", "referral_source"]);
+  if (!/^\d+$/.test(actor) || !allowed.has(field)) return { status: "invalid" };
+  return db.transaction(() => {
+    const participant = db.prepare(`SELECT p.* FROM participants p
+      JOIN accounts a ON a.participant_id=p.id AND a.platform='telegram'
+      WHERE a.messenger_user_id=?`).get(actor);
+    if (!participant) return { status: "not_found" };
+    if (participant.personal_data_consent !== 1 || !participant.consent_at || !participant.consent_version || participant.consent_withdrawn_at) {
+      return { status: "consent_withdrawn" };
+    }
+    const snapshot = createProfileEditSnapshot(participant);
+    saveDraft("telegram", actor, `profile_edit:${field}`, {
+      edit_field: field,
+      participant_id: Number(participant.id),
+      snapshot
+    });
+    return { status: "ready", participant, snapshot };
+  }).immediate();
+}
 function hasDraft(platform, userId) { return Boolean(db.prepare("SELECT 1 FROM registration_drafts WHERE platform=? AND messenger_user_id=?").get(platform,String(userId))); }
 function deleteDraft(platform, userId) { return db.prepare("DELETE FROM registration_drafts WHERE platform=? AND messenger_user_id=?").run(platform,String(userId)).changes > 0; }
 function getAdminRole(telegramId) { return db.prepare("SELECT role FROM admins WHERE telegram_id=?").get(String(telegramId))?.role ?? null; }
@@ -454,6 +512,18 @@ function deleteParticipantTransaction(participantId) {
   return db.transaction(() => {
     const preview = getParticipantDeletionPreview(id);
     if (!preview) return { deleted: false, participant_id: id, accounts_deleted: 0, registration_drafts_deleted: 0, withdrawal_requests_deleted: 0 };
+    const linkedAccounts = db.prepare("SELECT platform,messenger_user_id FROM accounts WHERE participant_id=?").all(id);
+    // Keep delivery outcomes for aggregate reporting, but remove the messenger
+    // identifier before the account is cascaded away. A tombstone based on the
+    // delivery row keeps the broadcast's unique recipient index valid.
+    const hasDeliveryHistory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meeting_deliveries'").get());
+    const anonymizedDeliveries = hasDeliveryHistory ? db.prepare(`UPDATE meeting_deliveries
+      SET messenger_user_id='deleted-delivery-' || id
+      WHERE participant_id=? OR (participant_id IS NULL AND EXISTS (
+        SELECT 1 FROM accounts a WHERE a.participant_id=?
+          AND a.platform=meeting_deliveries.platform
+          AND a.messenger_user_id=meeting_deliveries.messenger_user_id
+      ))`).run(id, id).changes : 0;
     const draftsDeleted = db.prepare(`DELETE FROM registration_drafts
       WHERE EXISTS (SELECT 1 FROM accounts a WHERE a.participant_id=? AND a.platform=registration_drafts.platform AND a.messenger_user_id=registration_drafts.messenger_user_id)`).run(id).changes;
     // Keep the minimal request record, but close the pending item in the same
@@ -463,10 +533,22 @@ function deleteParticipantTransaction(participantId) {
       SET status='processed' WHERE participant_id=? AND status='pending_review'`).run(id).changes;
     const participantDeleted = db.prepare("DELETE FROM participants WHERE id=?").run(id).changes;
     if (participantDeleted !== 1) throw new Error("Анкета изменилась во время удаления; транзакция отменена.");
+    // Remove the chat confirmation only after no active participant account
+    // uses that Telegram ID.
+    const hasPrivateChatHistory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_private_chats'").get());
+    for (const account of linkedAccounts) {
+      if (account.platform !== "telegram") continue;
+      if (hasPrivateChatHistory) {
+        db.prepare(`DELETE FROM telegram_private_chats WHERE telegram_id=?
+          AND NOT EXISTS (SELECT 1 FROM accounts WHERE platform='telegram' AND messenger_user_id=?)`)
+          .run(account.messenger_user_id, account.messenger_user_id);
+      }
+    }
     return {
       deleted: true,
       participant_id: id,
       accounts_deleted: preview.linked_accounts.length,
+      delivery_identifiers_anonymized: anonymizedDeliveries,
       registration_drafts_deleted: draftsDeleted,
       deletion_requests_processed: deletionRequestsProcessed,
       withdrawal_requests_deleted: preview.consent_withdrawal_requests
@@ -573,6 +655,19 @@ function getParticipantDataRequestCount() {
       SELECT id FROM consent_withdrawal_requests
     )`).get().count;
 }
+function recordTelegramPrivateChat(telegramId, at = new Date().toISOString()) {
+  const id = String(telegramId ?? "");
+  const timestamp = new Date(at);
+  if (!/^\d{1,20}$/.test(id) || Number.isNaN(timestamp.getTime())) return false;
+  const value = timestamp.toISOString();
+  db.prepare(`INSERT INTO telegram_private_chats(telegram_id,first_seen_at,last_seen_at) VALUES(?,?,?)
+    ON CONFLICT(telegram_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`).run(id, value, value);
+  return true;
+}
+function hasTelegramPrivateChat(telegramId) {
+  const id = String(telegramId ?? "");
+  return /^\d{1,20}$/.test(id) && Boolean(db.prepare("SELECT 1 FROM telegram_private_chats WHERE telegram_id=?").get(id));
+}
 function closeDatabase() { db.close(); }
-module.exports = { db, dbPath, schemaVersion: CURRENT_SCHEMA_VERSION, normalizePhone, addParticipant, registerParticipant, createDemoTestParticipant, isDemoTestParticipant, isDemoTestParticipantForTelegram, findParticipantByPhone, findParticipantByTelegramId, findParticipantByTelegramIdIncludingWithdrawn, listLinkedPlatformsForTelegram, listAccountLinkRequestsForTelegram, getAccountLinkRequestForTelegram, getParticipant, getParticipantIncludingWithdrawn, searchParticipants, listParticipants, updateParticipant, updatePhoneFromVerifiedTelegramContact, linkAccount, createAccountLinkRequest, transitionAccountLinkRequest, completeAccountLinkRequest, saveDraft, getDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, transferOwner, updateAdminUsername, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, getParticipantDeletionPreview, deleteParticipantById, deleteDemoTestParticipantById, getParticipantConsentState, recordConsentWithdrawalRequest, getConsentWithdrawalRequest, resolveConsentWithdrawalRequest, createParticipantDeletionRequestForTelegram, getParticipantDataRequestsForTelegram, listParticipantDataRequests, listDemoTestDeletionRequests, getParticipantDataRequestCount, closeDatabase };
+module.exports = { db, dbPath, schemaVersion: CURRENT_SCHEMA_VERSION, normalizePhone, addParticipant, registerParticipant, createDemoTestParticipant, isDemoTestParticipant, isDemoTestParticipantForTelegram, findParticipantByPhone, findParticipantByTelegramId, findParticipantByTelegramIdIncludingWithdrawn, listLinkedPlatformsForTelegram, listAccountLinkRequestsForTelegram, getAccountLinkRequestForTelegram, getParticipant, getParticipantIncludingWithdrawn, searchParticipants, listParticipants, updateParticipant, updateParticipantIfUnchanged, updatePhoneFromVerifiedTelegramContact, linkAccount, createAccountLinkRequest, transitionAccountLinkRequest, completeAccountLinkRequest, saveDraft, getDraft, beginProfileEditDraft, hasDraft, deleteDraft, getAdminRole, initializeOwner, transferOwner, updateAdminUsername, listAdmins, addAdmin, removeAdmin, getParticipantCount, getParticipantStatistics, getParticipantsForExport, getParticipantDeletionPreview, deleteParticipantById, deleteDemoTestParticipantById, getParticipantConsentState, recordConsentWithdrawalRequest, getConsentWithdrawalRequest, resolveConsentWithdrawalRequest, createParticipantDeletionRequestForTelegram, getParticipantDataRequestsForTelegram, listParticipantDataRequests, listDemoTestDeletionRequests, getParticipantDataRequestCount, recordTelegramPrivateChat, hasTelegramPrivateChat, closeDatabase };
 

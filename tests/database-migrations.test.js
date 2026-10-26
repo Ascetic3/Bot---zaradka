@@ -62,7 +62,7 @@ test("новая пустая база проходит последовател
   try {
     const result = migrateDatabase(db);
     assert.equal(result.to, CURRENT_SCHEMA_VERSION);
-    assert.deepEqual(result.applied.map((step) => step.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(result.applied.map((step) => step.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     assert.equal(inspectSchema(db, { allowKnownOptionalColumns: false }).version, CURRENT_SCHEMA_VERSION);
     assert.equal(db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_at"), true);
     assert.equal(db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_version"), true);
@@ -76,7 +76,7 @@ test("старая схема обновляется без потери уча�
     const participantId = fill(x.db);
     const preview = previewMigrations(x.db);
     assert.equal(preview.currentVersion, 1);
-    assert.deepEqual(preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     const result = migrateDatabase(x.db);
     assert.equal(result.to, CURRENT_SCHEMA_VERSION);
     assert.equal(x.db.prepare("SELECT first_name FROM participants WHERE id=?").get(participantId).first_name, "ВымышленноеИмя");
@@ -105,9 +105,9 @@ test("копия фактической клубной схемы с consent_at 
     const preview = previewMigrations(x.db);
     assert.equal(preview.currentVersion, 0);
     assert.equal(preview.structuralVersion, 2);
-    assert.deepEqual(preview.plan.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9, 10, 11]);
     const result = migrateDatabase(x.db);
-    assert.deepEqual(result.applied.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(result.applied.map((step) => step.version), [3, 4, 5, 6, 7, 8, 9, 10, 11]);
     const columns = x.db.prepare("PRAGMA table_info(participants)").all().map((column) => column.name);
     assert.equal(columns.filter((name) => name === "consent_at").length, 1);
     assert.equal(columns.includes("consent_version"), true);
@@ -122,10 +122,10 @@ test("полная схема версии 4 с user_version=0 применяе�
     const beforeDdl = x.db.prepare("SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY type,name").all();
     const preview = previewMigrations(x.db);
     assert.equal(preview.structuralVersion, 4);
-    assert.deepEqual(preview.plan.map((step) => step.version), [5, 6, 7, 8, 9]);
+    assert.deepEqual(preview.plan.map((step) => step.version), [5, 6, 7, 8, 9, 10, 11]);
     const result = migrateDatabase(x.db);
     assert.equal(result.stampedVersion, true);
-    assert.deepEqual(result.applied.map((step) => step.version), [5, 6, 7, 8, 9]);
+    assert.deepEqual(result.applied.map((step) => step.version), [5, 6, 7, 8, 9, 10, 11]);
     assert.notDeepEqual(x.db.prepare("SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY type,name").all(), beforeDdl);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS count FROM consent_withdrawal_requests").get().count, 0);
     assert.equal(x.db.pragma("user_version", { simple: true }), CURRENT_SCHEMA_VERSION);
@@ -293,7 +293,7 @@ test("миграция v9 добавляет маркеры только для 
     assert.equal(x.db.pragma("user_version", { simple: true }), 8);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='demo_test_participants'").get().n, 0);
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM participants").get().n, 1);
-    const result = migrateDatabase(x.db);
+    const result = migrateDatabase(x.db, { targetVersion: 9 });
     assert.deepEqual(result.applied.map((step) => step.version), [9]);
     const schema = inspectSchema(x.db);
     assert.equal(schema.version, 9);
@@ -305,6 +305,43 @@ test("миграция v9 добавляет маркеры только для 
     assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM demo_test_participants").get().n, 0);
     assert.equal(x.db.pragma("integrity_check", { simple: true }), "ok");
     assert.equal(x.db.pragma("foreign_key_check").length, 0);
+    assert.deepEqual(migrateDatabase(x.db, { targetVersion: 9 }).applied, []);
+  } finally { x.close(); }
+});
+
+test("миграция v10 создаёт таблицы рассылок; v11 добавляет общий лимитер атомарно", () => {
+  const x = fixture({ version: 1 });
+  try {
+    fill(x.db);
+    migrateDatabase(x.db, { targetVersion: 9 });
+    assert.throws(() => migrateDatabase(x.db, { targetVersion: 10, beforeVersionCommit(version) { if (version === 10) throw new Error("synthetic v10 failure"); } }), /synthetic v10 failure/);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 9);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='meetings'").get().n, 0);
+    migrateDatabase(x.db, { targetVersion: 10 });
+    assert.equal(x.db.pragma("user_version", { simple: true }), 10);
+    assert.equal(inspectSchema(x.db).version, 10);
+    assert.throws(() => migrateDatabase(x.db, { beforeVersionCommit(version) { if (version === 11) throw new Error("synthetic v11 failure"); } }), /synthetic v11 failure/);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 10, "ошибка v11 должна откатить DDL и метку версии");
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='meeting_send_rate_limit_state'").get().n, 0);
+    const result = migrateDatabase(x.db);
+    assert.deepEqual(result.applied.map((step) => step.version), [11]);
+    assert.equal(x.db.pragma("user_version", { simple: true }), 11);
+    assert.equal(inspectSchema(x.db).version, 11);
+    assert.deepEqual(x.db.prepare("SELECT singleton_id,next_allowed_at,blocked_until FROM meeting_send_rate_limit_state").get(), { singleton_id: 1, next_allowed_at: null, blocked_until: null });
+    assert.deepEqual(x.db.prepare("SELECT sender_token,sender_pid,sender_host,sender_delivery_id,sender_acquired_at FROM meeting_send_rate_limit_state").get(),
+      { sender_token: null, sender_pid: null, sender_host: null, sender_delivery_id: null, sender_acquired_at: null });
+    assert.throws(() => x.db.prepare("INSERT INTO meeting_send_rate_limit_state(singleton_id) VALUES(2)").run(), /CHECK/);
+    assert.equal(inspectSchema(x.db).version, 11);
+    assert.equal(x.db.prepare("PRAGMA index_list(meeting_broadcasts)").all().some((index) => index.name === "idx_meeting_broadcasts_due"), true);
+    assert.equal(x.db.prepare("PRAGMA index_list(meeting_deliveries)").all().some((index) => index.name === "uq_meeting_deliveries_recipient" && index.unique), true);
+    assert.equal(x.db.prepare("PRAGMA foreign_key_list(meeting_deliveries)").all().some((fk) => fk.table === "participants" && fk.on_delete === "SET NULL"), true);
+    const deliveryTableSql = x.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='meeting_deliveries'").get().sql;
+    assert.match(deliveryTableSql, /'uncertain'/, "v10 допускает явное состояние неопределённой отправки");
+    assert.throws(() => x.db.prepare("INSERT INTO meeting_broadcasts(meeting_id,status,scheduled_at,timezone,created_by) VALUES(1,'bogus','2030-01-01T00:00:00Z','Etc/UTC','700000001')").run(), /CHECK/);
+    assert.equal(x.db.pragma("foreign_key_check").length, 0);
+    assert.equal(x.db.pragma("integrity_check", { simple: true }), "ok");
+    assert.equal(x.db.pragma("user_version", { simple: true }), 11);
+    assert.equal(x.db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='meeting_notification_consents'").get().count, 0);
     assert.deepEqual(migrateDatabase(x.db).applied, []);
   } finally { x.close(); }
 });
@@ -350,7 +387,7 @@ test("режим предварительной проверки миграци�
   try {
     const result = runMigrationCommand({ mode: "check", databasePath: x.file });
     assert.equal(result.preview.currentVersion, 1);
-    assert.deepEqual(result.preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(result.preview.plan.map((step) => step.version), [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     assert.equal(x.db.pragma("user_version", { simple: true }), 1);
     assert.equal(x.db.prepare("PRAGMA table_info(participants)").all().some((column) => column.name === "consent_at"), false);
   } finally { x.close(); }
