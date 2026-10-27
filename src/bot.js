@@ -1,5 +1,6 @@
 require("dotenv").config();
 const path = require("node:path");
+const https = require("node:https");
 const { assertDatabaseMode } = require("./database/config");
 try {
   assertDatabaseMode(undefined, { projectRoot: path.resolve(__dirname, "..") });
@@ -28,7 +29,12 @@ const { createMeetingBroadcastRuntime } = require("./meeting-broadcast-runtime")
 const { demoIds } = require("./meeting-broadcasts");
 const { createUpdateTracker, createGracefulShutdown, installSignalHandlers } = require("./lifecycle");
 
-const bot = new Bot(token);
+// grammY uses node-fetch with its own https.Agent, so Node's global
+// NODE_USE_ENV_PROXY setting alone does not route Telegram requests through a proxy.
+const proxyConfigured = Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
+const bot = new Bot(token, proxyConfigured ? {
+  client: { baseFetchConfig: { agent: new https.Agent({ keepAlive: true, proxyEnv: process.env }) } }
+} : undefined);
 bot.catch(handleBotError);
 const tracker = createUpdateTracker();
 bot.use((ctx, next) => tracker.middleware(ctx, next));
@@ -83,4 +89,3 @@ pollingPromise.catch((error) => {
   handleStartupError(error);
   void shutdown.shutdown("startup_error");
 });
-

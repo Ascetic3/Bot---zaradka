@@ -3,6 +3,7 @@ const path = require("node:path");
 const Database = require("better-sqlite3");
 const { createDemoRecords } = require("./data");
 const { getDatabasePath } = require("../database/config");
+const { isValidProfileEditDraft } = require("../profile-edit-snapshot");
 
 const requiredTables = ["participants", "accounts", "admins", "registration_drafts"];
 const seedName = "magic-morning-demo";
@@ -98,7 +99,35 @@ function assertSeedMatches(database, records, metadata) {
       WHERE t.participant_id IS NULL ORDER BY p.phone, a.platform, a.messenger_user_id`).all();
   const actualKeys = accountRows.map((row) => `${row.phone ?? `ORPHAN-${row.participant_id}`}\u0000${row.platform}\u0000${row.messenger_user_id}`).sort();
   if (JSON.stringify(actualKeys) !== JSON.stringify(expectedAccountKeys(records))) throw new Error("Связанные демонстрационные аккаунты изменились. Проверка остановлена без изменений.");
-  if (connection.prepare("SELECT COUNT(*) AS count FROM registration_drafts").get().count !== 0) throw new Error("В демонстрационной базе обнаружены незавершённые анкеты. Проверка остановлена без изменений.");
+  assertDemoRegistrationDrafts(connection);
+}
+
+function assertDemoRegistrationDrafts(connection) {
+  const allowedSteps = new Set([
+    "profile_edit_select",
+    "profile_edit:first_name",
+    "profile_edit:last_name",
+    "profile_edit:city",
+    "profile_edit:email",
+    "profile_edit:preferred_contact",
+    "profile_edit:referral_source"
+  ]);
+  const drafts = connection.prepare("SELECT platform, messenger_user_id, current_step, answers_json FROM registration_drafts ORDER BY platform, messenger_user_id").all();
+  for (const draft of drafts) {
+    if (draft.platform !== "telegram" || !/^\d+$/.test(String(draft.messenger_user_id)) || !allowedSteps.has(draft.current_step)) {
+      throw new Error("В демонстрационной базе найден недопустимый незавершённый черновик.");
+    }
+    let answers;
+    try { answers = JSON.parse(draft.answers_json); } catch { throw new Error("В демонстрационной базе найден повреждённый черновик редактирования."); }
+    const owner = connection.prepare(`SELECT a.participant_id FROM accounts a
+      JOIN demo_test_participants t ON t.participant_id=a.participant_id
+      JOIN participants p ON p.id=t.participant_id
+      WHERE a.platform='telegram' AND a.messenger_user_id=? AND p.consent_withdrawn_at IS NULL`).get(String(draft.messenger_user_id));
+    if (!owner) throw new Error("Черновик редактирования не связан с активной тестовой анкетой своего Telegram-аккаунта.");
+    if (!isValidProfileEditDraft(draft.current_step, answers, owner.participant_id)) {
+      throw new Error("Черновик редактирования содержит некорректный или неподтверждённый снимок анкеты.");
+    }
+  }
 }
 
 function assertDemoOwner(database, ownerTelegramId) {
@@ -206,11 +235,10 @@ function verifyDemoDatabase({ databasePath = defaultDemoPath, productionDatabase
   const probe = new DatabaseConstructor(databasePath, { readonly: true, fileMustExist: true });
   try {
     assertSeedMatches(probe, expectedRecords, inspection.metadata);
-    if (inspection.counts.registration_drafts !== 0) throw new Error("В демонстрационной базе обнаружены незавершённые анкеты. Запуск остановлен без изменений.");
+    assertDemoRegistrationDrafts(probe);
     assertDemoOwner(probe, ownerTelegramId);
     return { count: inspection.counts.participants, ownerConfigured: true };
   } finally { probe.close(); }
 }
 
 module.exports = { seedDemoDatabase, verifyDemoDatabase, defaultDemoPath, defaultProductionPath, ensureSafeTarget };
-

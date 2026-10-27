@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 31167)
-Total output lines: 1867
-
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -894,7 +891,85 @@ test("конфигурация планировщика из точки вход
   } finally { x.close(); }
 });
 
-test("планировщик отказывается запускать рассылки без Telegram-адаптера",…1167 tokens truncated…PrivateChat = x.recipient({ id: "880114" });
+test("планировщик отказывается запускать рассылки без Telegram-адаптера", async () => {
+  const x = fixture();
+  try {
+    const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
+    const scheduler = createMeetingBroadcastScheduler({ store: x.store, adapters: {}, getAdminRole: () => "owner" });
+    await assert.rejects(scheduler.tick(), /не настроен Telegram-адаптер/);
+    assert.equal(x.store.get(id).status, "scheduled");
+    assert.throws(() => scheduler.start(), /не настроен Telegram-адаптер/);
+  } finally { x.close(); }
+});
+
+test("планировщик обрабатывает 500 получателей через поддельный Telegram API", async () => {
+  const x = fixture();
+  try {
+    for (let index = 0; index < 500; index += 1) x.recipient({ id: String(900000 + index) });
+    const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
+    let time = new Date();
+    const startedAt = [];
+    const telegram = { async sendMessage(chatId) { startedAt.push({ chatId: String(chatId), at: time.getTime() }); } };
+    const scheduler = createScheduler({ store: x.store, adapters: { telegram }, getAdminRole: () => "owner", now: () => time,
+      sleep: async (ms) => { time = new Date(time.getTime() + ms); }, minSendIntervalMs: 50 });
+    await scheduler.tick();
+    assert.equal(startedAt.length, 500);
+    assert.ok(startedAt.slice(1).every((value, index) => value.at - startedAt[index].at >= 50));
+    assert.equal(x.store.summary(id, "880001").deliveries.sent, 500);
+    assert.equal(x.store.get(id).status, "completed");
+  } finally { x.close(); }
+});
+
+test("500 смешанных результатов не обходят исключительное право и не создают дубликаты", async () => {
+  const x = fixture();
+  try {
+    x.db.transaction(() => {
+      for (let index = 0; index < 500; index += 1) x.recipient({ id: String(900000 + index) });
+    }).immediate();
+    const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
+    let time = new Date();
+    const starts = [];
+    const api = { async sendMessage(chatId) {
+      starts.push({ id: String(chatId), at: time.getTime() });
+      const index = Number(chatId) - 900000;
+      if (index % 4 === 1) throw { error_code: 403, description: "Forbidden" };
+      if (index % 4 === 2) throw { error_code: 400, description: "Bad Request: chat not found" };
+    } };
+    const scheduler = createScheduler({ store: x.store, adapters: { telegram: api }, getAdminRole: () => "owner", now: () => time,
+      sleep: async (ms) => { time = new Date(time.getTime() + ms); }, minSendIntervalMs: 50 });
+    await scheduler.tick();
+    assert.equal(starts.length, 500);
+    assert.equal(new Set(starts.map((item) => item.id)).size, 500);
+    assert.ok(starts.slice(1).every((item, index) => item.at - starts[index].at >= 50));
+    const summary = x.store.summary(id);
+    assert.equal(summary.deliveries.sent, 250);
+    assert.equal(summary.deliveries.unavailable, 250);
+    assert.equal(summary.status, "completed");
+    assert.equal(x.store.getSenderState().sender_token, null);
+  } finally { x.close(); }
+});
+
+test("если создатель лишился административной роли до рассылки, задания не отправляются", async () => {
+  const x = fixture();
+  try {
+    x.recipient({ id: "880109" });
+    const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
+    const telegram = fakeTelegram();
+    const scheduler = createMeetingBroadcastScheduler({ store: x.store, adapters: { telegram: telegram.api }, getAdminRole: () => null, now: () => new Date(), sleep: async () => {} });
+    await scheduler.tick();
+    assert.equal(telegram.sent.length, 0);
+    assert.equal(x.store.get(id).status, "failed");
+    assert.equal(x.store.get(id).last_error_code, "ADMIN_ACCESS_REVOKED");
+  } finally { x.close(); }
+});
+
+test("согласие, телефон и личный чат проверяются; предпочтительный канал не исключает Zoom-уведомления", async () => {
+  const x = fixture();
+  try {
+    const good = x.recipient({ id: "880111" });
+    const noConsent = x.recipient({ id: "880112", consent: false });
+    const otherChannel = x.recipient({ id: "880113", preferred: "Email" });
+    const noPrivateChat = x.recipient({ id: "880114" });
     x.db.prepare("DELETE FROM telegram_private_chats WHERE telegram_id=?").run("880114");
     const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
     const telegram = fakeTelegram();
@@ -1789,4 +1864,3 @@ test("интеграция экстренной остановки: подтве
     for (const item of modules) delete require.cache[require.resolve(item)];
   }
 });
-
