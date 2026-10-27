@@ -7,6 +7,9 @@ try {
   console.error(`Запуск остановлен: ${error.message}`);
   process.exit(1);
 }
+// The read-only preflight above validated an existing v11 database. Make the
+// subsequent SQLite open fail closed if the file disappears in between.
+process.env.MAGIC_MORNING_REQUIRE_EXISTING_DB = "true";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {

@@ -7,8 +7,9 @@ const { initializeEmptyDatabase, CURRENT_SCHEMA_VERSION } = require("./migration
 const { createProfileEditSnapshot } = require("../profile-edit-snapshot");
 
 const dbPath = getDatabasePath();
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-const db = new Database(dbPath, { timeout: 5000 });
+const requireExistingDatabase = process.env.MAGIC_MORNING_REQUIRE_EXISTING_DB === "true";
+if (!requireExistingDatabase) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+const db = new Database(dbPath, { timeout: 5000, fileMustExist: requireExistingDatabase });
 // Normalize only for comparisons: Russian ё and е are equivalent in participant search.
 // Latin e remains unchanged because the replacement applies only to Cyrillic ё.
 const normalizeSearchText = (value) => String(value ?? "").toLocaleLowerCase("ru-RU").replace(/ё/g, "е");

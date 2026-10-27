@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 31169)
-Total output lines: 1871
+Warning: truncated output (original token count: 31167)
+Total output lines: 1867
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -894,7 +894,7 @@ test("конфигурация планировщика из точки вход
   } finally { x.close(); }
 });
 
-test("планировщик отказывается запускать рассылки без Telegram-адаптера",…1169 tokens truncated…hat = x.recipient({ id: "880114" });
+test("планировщик отказывается запускать рассылки без Telegram-адаптера",…1167 tokens truncated…PrivateChat = x.recipient({ id: "880114" });
     x.db.prepare("DELETE FROM telegram_private_chats WHERE telegram_id=?").run("880114");
     const id = x.draft({ scheduledAt: new Date(Date.now() - 1000).toISOString(), startsAt: new Date(Date.now() + 3_600_000).toISOString() });
     const telegram = fakeTelegram();
@@ -1789,8 +1789,4 @@ test("интеграция экстренной остановки: подтве
     for (const item of modules) delete require.cache[require.resolve(item)];
   }
 });
-
-
-
-
 
